@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <algorithm>
 #include <sstream>
+#include <iomanip>
 #include <map>
 #include <chrono>
 
@@ -27,9 +28,11 @@ public:
         reconnect_delay_ = this->get_parameter("reconnect_delay_sec").as_double();
         max_reconnect_attempts_ = this->get_parameter("max_reconnect_attempts").as_int();
 
-        RCLCPP_INFO(this->get_logger(), "=== TCP-клиент запущен ===");
+        RCLCPP_INFO(this->get_logger(), "=== TCP-клиент запущен с параметрами ===");
         RCLCPP_INFO(this->get_logger(), "  server_ip: %s", server_ip_.c_str());
         RCLCPP_INFO(this->get_logger(), "  server_port: %d", server_port_);
+        RCLCPP_INFO(this->get_logger(), "  reconnect_delay: %.1f сек", reconnect_delay_);
+        RCLCPP_INFO(this->get_logger(), "  max_reconnect_attempts: %d", max_reconnect_attempts_);
 
         telega_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/telega_commands", 10);
         camera_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/camera_control", 10);
@@ -67,7 +70,7 @@ private:
                     read_thread_ = std::thread(&TcpClientNode::read_from_server, this);
                 } else {
                     if (max_reconnect_attempts_ > 0 && attempt >= max_reconnect_attempts_) {
-                        RCLCPP_ERROR(this->get_logger(), "❌ Достигнут лимит попыток.");
+                        RCLCPP_ERROR(this->get_logger(), "❌ Достигнут лимит попыток. Завершение.");
                         rclcpp::shutdown();
                         return;
                     }
@@ -78,7 +81,7 @@ private:
                 }
             } else {
                 if (!is_connected()) {
-                    RCLCPP_WARN(this->get_logger(), "Соединение потеряно.");
+                    RCLCPP_WARN(this->get_logger(), "Соединение потеряно. Переподключение...");
                     close(sockfd_);
                     sockfd_ = -1;
                     if (read_thread_.joinable())
@@ -119,6 +122,16 @@ private:
         int flags = fcntl(sockfd_, F_GETFL, 0);
         if (flags != -1) {
             fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        // ==========================================
+        // ОТПРАВЛЯЕМ ПРИВЕТСТВИЕ СЕРВЕРУ
+        // ==========================================
+        std::string hello = "HELLO\n";
+        if (send(sockfd_, hello.c_str(), hello.length(), 0) < 0) {
+            RCLCPP_WARN(this->get_logger(), "Не удалось отправить приветствие: %s", strerror(errno));
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Отправлено приветствие серверу");
         }
 
         return true;
@@ -180,22 +193,33 @@ private:
     }
 
     void process_server_message(const std::string& line) {
+        // Игнорируем приветствие от сервера, если оно есть
+        if (line == "HELLO") return;
+
         auto msg = std_msgs::msg::String();
 
         // Обработка команд в формате KEY:название:действие
         if (line.find("KEY:") == 0) {
             std::string key_info = line.substr(4);
 
+            // Расширенный маппинг клавиш
             std::map<std::string, std::string> key_mapping = {
+                // Тележка
                 {"W:press", "w"}, {"S:press", "s"},
                 {"A:press", "a"}, {"D:press", "d"},
-                {"Q:press", "q"}, {"E:press", "e"},
+                {"Q:press", "q"}, {"E:press", "e"},  // ДОБАВЛЕНА КЛАВИША E
                 {"R:press", "r"}, {"F:press", "f"},
                 {"SPACE:press", " "},
+
+                // Камера - стрелки
                 {"UP:press", "UP"}, {"DOWN:press", "DOWN"},
                 {"LEFT:press", "LEFT"}, {"RIGHT:press", "RIGHT"},
+
+                // Камера - зум и режимы
                 {"PLUS:press", "PLUS"}, {"MINUS:press", "MINUS"},
                 {"Z:press", "Z"}, {"X:press", "X"}, {"C:press", "C"},
+
+                // Переключение видеопотока (ДОБАВЛЕНЫ)
                 {"1:press", "1"}, {"2:press", "2"}
             };
 
@@ -204,24 +228,28 @@ private:
                 std::string command = it->second;
                 msg.data = command;
 
+                // Определяем, куда отправлять команду
                 if (command == "UP" || command == "DOWN" || command == "LEFT" || command == "RIGHT" ||
                     command == "PLUS" || command == "MINUS" || command == "Z" || command == "X" || command == "C" ||
-                    command == "1" || command == "2") {
+                    command == "1" || command == "2") {  // ДОБАВЛЕНЫ 1 и 2
                     camera_cmd_pub_->publish(msg);
                     RCLCPP_INFO(this->get_logger(), "📷 Команда камере: '%s'", command.c_str());
                 } else {
                     telega_cmd_pub_->publish(msg);
                     RCLCPP_INFO(this->get_logger(), "🚜 Команда тележке: '%s'", command.c_str());
                 }
+            } else {
+                RCLCPP_DEBUG(this->get_logger(), "Неизвестная клавиша: %s", key_info.c_str());
             }
         }
-        // Прямые команды
+        // Прямые команды для тележки
         else if (line.find("TELEGA:") == 0) {
             std::string cmd = line.substr(7);
             msg.data = cmd;
             telega_cmd_pub_->publish(msg);
             RCLCPP_INFO(this->get_logger(), "🚜 TCP TELEGA: '%s'", cmd.c_str());
         }
+        // Прямые команды для камеры
         else if (line.find("CAMERA:") == 0) {
             std::string cmd = line.substr(7);
             msg.data = cmd;

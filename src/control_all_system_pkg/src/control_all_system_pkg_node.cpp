@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <sstream>
 
 using namespace std::chrono_literals;
 
@@ -56,8 +57,8 @@ public:
         this->declare_parameter<int>("steering_right_pwm", 1650);
         this->declare_parameter<int>("neutral_pwm", 1500);
         this->declare_parameter<std::string>("telega_cmd_topic", "/telega_commands");
+        this->declare_parameter<std::string>("status_topic", "/telega_status");
 
-        // НОВЫЕ ПАРАМЕТРЫ ДЛЯ TCP
         this->declare_parameter<int>("tcp_timeout_ms", 800);
         this->declare_parameter<int>("keyboard_timeout_ms", 200);
 
@@ -68,8 +69,8 @@ public:
         steering_right_pwm_ = this->get_parameter("steering_right_pwm").as_int();
         neutral_pwm_ = this->get_parameter("neutral_pwm").as_int();
         telega_cmd_topic_ = this->get_parameter("telega_cmd_topic").as_string();
+        status_topic_ = this->get_parameter("status_topic").as_string();
 
-        // Загружаем новые параметры
         tcp_timeout_ms_ = this->get_parameter("tcp_timeout_ms").as_int();
         keyboard_timeout_ms_ = this->get_parameter("keyboard_timeout_ms").as_int();
 
@@ -118,7 +119,6 @@ public:
         last_throttle_press_time_ = this->now();
         last_steering_press_time_ = this->now();
 
-        // НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ TCP
         is_tcp_mode_ = false;
         last_tcp_command_time_ = this->now();
 
@@ -139,6 +139,7 @@ public:
         gimbal_pub_ = this->create_publisher<mavros_msgs::msg::GimbalManagerSetPitchyaw>(gimbal_topic_, 10);
         angle_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(angle_publish_topic_, 10);
         stream_pub_ = this->create_publisher<std_msgs::msg::Int32>("/set_rtsp_stream", 10);
+        status_pub_ = this->create_publisher<std_msgs::msg::String>(status_topic_, 10);
 
         // Клиенты сервисов
         command_client_ = this->create_client<mavros_msgs::srv::CommandLong>("/mavros/cmd/command");
@@ -150,11 +151,13 @@ public:
         // Таймеры
         telega_timer_ = this->create_wall_timer(50ms, std::bind(&UnifiedController::telegaControlLoop, this));
         process_queue_timer_ = this->create_wall_timer(10ms, std::bind(&UnifiedController::processKeyQueue, this));
+        status_timer_ = this->create_wall_timer(100ms, std::bind(&UnifiedController::publishStatus, this));
 
         RCLCPP_INFO(this->get_logger(), "========================================");
         RCLCPP_INFO(this->get_logger(), "ОБЪЕДИНЕННЫЙ КОНТРОЛЛЕР ЗАПУЩЕН");
         RCLCPP_INFO(this->get_logger(), "🚜 Тележка: %s", telega_cmd_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "📷 Камера: %s", camera_cmd_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "📊 Статус: %s", status_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "⚙️ TCP таймаут: %d мс, клавиатура: %d мс", tcp_timeout_ms_, keyboard_timeout_ms_);
         RCLCPP_INFO(this->get_logger(), "========================================");
         printHelp();
@@ -169,9 +172,7 @@ public:
     }
 
 private:
-    // ВСПОМОГАТЕЛЬНЫЙ МЕТОД ДЛЯ ПОЛУЧЕНИЯ ТЕКУЩЕЙ СКОРОСТИ КРУИЗА
     int getCruiseSpeed() {
-        // Используем те же значения, что и в ручном режиме
         return neutral_pwm_ + manual_speed_step_;
     }
 
@@ -200,6 +201,21 @@ private:
                   << "        " << std::flush;
     }
 
+    void publishStatus() {
+        std::stringstream ss;
+        ss << "Тележка: ШИМ: вперед=" << (neutral_pwm_ + manual_speed_step_)
+           << " назад=" << (neutral_pwm_ - manual_speed_step_)
+           << " | круиз F=" << getCruiseSpeed()
+           << " B=" << getCruiseSpeedBackward()
+           << " | руль: лево=" << steering_left_pwm_
+           << " право=" << steering_right_pwm_
+           << (is_tcp_mode_ ? " [TCP]" : " [KB]");
+
+        auto msg = std_msgs::msg::String();
+        msg.data = ss.str();
+        status_pub_->publish(msg);
+    }
+
     void stateCallback(const mavros_msgs::msg::State::SharedPtr msg) {
         is_connected_ = msg->connected;
         if (is_armed_ != msg->armed) {
@@ -208,12 +224,10 @@ private:
         }
     }
 
-    // ИЗМЕНЕННЫЙ ОБРАБОТЧИК TCP КОМАНД
     void telegaCmdCallback(const std_msgs::msg::String::SharedPtr msg) {
         std::string cmd = msg->data;
         RCLCPP_INFO(this->get_logger(), "🚜 TCP: '%s'", cmd.c_str());
 
-        // ВКЛЮЧАЕМ TCP РЕЖИМ
         is_tcp_mode_ = true;
         last_tcp_command_time_ = this->now();
 
@@ -303,7 +317,6 @@ private:
         }
     }
 
-    // ПОТОК ДЛЯ ЧТЕНИЯ КЛАВИШ
     void keyboardReader() {
         while (running_) {
             int key = getch_nonblock();
@@ -530,7 +543,6 @@ private:
         if (is_armed_) {
             int current_linear;
             if (cruise_control_active_) {
-                // ИСПОЛЬЗУЕМ ТЕ ЖЕ ЗНАЧЕНИЯ, ЧТО И В РУЧНОМ РЕЖИМЕ
                 current_linear = getCruiseSpeed();
             } else if (cruise_control_backward_) {
                 current_linear = getCruiseSpeedBackward();
@@ -653,6 +665,7 @@ private:
     bool cruise_control_backward_;
     rclcpp::Time last_throttle_press_time_, last_steering_press_time_;
     std::string telega_cmd_topic_;
+    std::string status_topic_;
 
     bool is_tcp_mode_;
     rclcpp::Time last_tcp_command_time_;
@@ -677,6 +690,7 @@ private:
     rclcpp::Publisher<mavros_msgs::msg::GimbalManagerSetPitchyaw>::SharedPtr gimbal_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr angle_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr stream_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
     // Клиенты сервисов
     rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedPtr command_client_;
@@ -685,6 +699,7 @@ private:
     // Таймеры
     rclcpp::TimerBase::SharedPtr telega_timer_;
     rclcpp::TimerBase::SharedPtr process_queue_timer_;
+    rclcpp::TimerBase::SharedPtr status_timer_;
 
     // Очередь событий
     std::queue<int> key_queue_;
