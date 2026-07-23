@@ -282,6 +282,9 @@ private:
         std::cout << "  Z/X/C - Зум +/-/Стоп" << std::endl;
         std::cout << "========================================" << COLOR_RESET << std::endl;
 
+        std::string last_sent_command;
+        std::chrono::steady_clock::time_point last_sent_time;
+
         while (running_ && rclcpp::ok()) {
             int ch = getch_nonblock();
 
@@ -374,8 +377,8 @@ private:
                         break;
                     }
                 }
+                break;
             }
-            break;
             case '+': case '=':
                 ros_command = "PLUS";
                 tcp_command = "KEY:PLUS:press\n";
@@ -410,6 +413,19 @@ private:
                 send_to_tcp = false;
                 break;
             }
+
+            // === ЗАЩИТА ОТ ДУБЛИРОВАНИЯ ===
+            auto now = std::chrono::steady_clock::now();
+            if (!tcp_command.empty() && tcp_command == last_sent_command) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sent_time);
+                if (elapsed.count() < 300) {
+                    std::cout << "⏭️ Игнорируем дублирующую команду: " << tcp_command;
+                    continue;
+                }
+            }
+            last_sent_command = tcp_command;
+            last_sent_time = now;
+            // ================================
 
             if (send_to_tcp && !tcp_command.empty()) {
                 send_to_clients(tcp_command.c_str(), tcp_command.length());
