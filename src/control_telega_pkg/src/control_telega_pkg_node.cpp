@@ -269,6 +269,7 @@ private:
             cruise_control_active_ = false;
         }
 
+        //Фргамент кода котоырй отвечает за выбор выода шим сигнала
         sendServoCommand(1, pwm_motor1);
         sendServoCommand(2, pwm_motor2);
     }
