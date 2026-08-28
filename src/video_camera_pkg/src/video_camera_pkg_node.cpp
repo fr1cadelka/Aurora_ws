@@ -1,5 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <opencv2/opencv.hpp>
 #include <thread>
 #include <atomic>
@@ -12,55 +12,46 @@ class VideoCamera : public rclcpp::Node
 public:
     VideoCamera() : Node("video_camera_node"), running_(true), frame_ready_(false)
     {
-        RCLCPP_INFO(this->get_logger(), "=== VideoCamera Low-Latency Stable FPS ===");
+        RCLCPP_INFO(this->get_logger(), "=== VideoCamera (MJPEG → JPEG once) ===");
 
-        this->declare_parameter<std::string>("rtsp_url",
-                                             "rtsp://admin:aurora_2050@192.168.31.166:554/Streaming/Channels/102"); // SUB-STREAM!
+        this->declare_parameter<std::string>("stream_url",
+                                             "http://admin:aurora_2050@192.168.31.166/ISAPI/Streaming/channels/102/httpPreview");
         this->declare_parameter<int>("target_fps", 25);
-        this->declare_parameter<int>("width", 960);
-        this->declare_parameter<int>("height", 432);
+        this->declare_parameter<int>("jpeg_quality", 50);
 
-        std::string url = this->get_parameter("rtsp_url").as_string();
-        target_fps_ = this->get_parameter("target_fps").as_int();
-        int width  = this->get_parameter("width").as_int();
-        int height = this->get_parameter("height").as_int();
+        std::string url = this->get_parameter("stream_url").as_string();
+        target_fps_   = this->get_parameter("target_fps").as_int();
+        jpeg_quality_ = this->get_parameter("jpeg_quality").as_int();
 
-        RCLCPP_INFO(this->get_logger(), "RTSP: %s", url.c_str());
-        RCLCPP_INFO(this->get_logger(), "Target FPS: %d", target_fps_);
+        RCLCPP_INFO(this->get_logger(), "URL: %s", url.c_str());
+        RCLCPP_INFO(this->get_logger(), "FPS: %d | JPEG quality: %d", target_fps_, jpeg_quality_);
 
-        // Максимально агрессивные настройки низкой задержки
         setenv("OPENCV_FFMPEG_CAPTURE_OPTIONS",
-               "rtsp_transport;tcp|"
-               "fflags;nobuffer+discardcorrupt+genpts|"
+               "fflags;nobuffer+discardcorrupt|"
                "flags;low_delay|"
                "max_delay;0|"
                "analyzeduration;0|"
                "probesize;32|"
                "buffer_size;1024|"
-               "framedrop;1|"
-               "reorder_queue_size;0",
+               "framedrop;1",
                1);
 
         cap_.open(url, cv::CAP_FFMPEG);
         if (!cap_.isOpened()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open camera!");
-            throw std::runtime_error("Camera open failed");
+            RCLCPP_ERROR(this->get_logger(), "Failed to open stream");
+            throw std::runtime_error("Stream open failed");
         }
-
         cap_.set(cv::CAP_PROP_BUFFERSIZE, 1);
-        // Не ставим WIDTH/HEIGHT — камера сама отдаёт то, что настроено в sub-stream
 
-        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(
-            "/camera_image",
+        publisher_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
+            "/camera_image/compressed",
             rclcpp::QoS(rclcpp::KeepLast(1)).best_effort()
             );
 
-        // Поток захвата всегда крутится и хранит только последний кадр
         capture_thread_ = std::thread(&VideoCamera::capture_loop, this);
-        // Поток публикации с фиксированной частотой
         publish_thread_ = std::thread(&VideoCamera::publish_loop, this);
 
-        RCLCPP_INFO(this->get_logger(), "Camera started (stable FPS mode)");
+        RCLCPP_INFO(this->get_logger(), "Camera started");
     }
 
     ~VideoCamera()
@@ -69,12 +60,11 @@ public:
         if (capture_thread_.joinable()) capture_thread_.join();
         if (publish_thread_.joinable()) publish_thread_.join();
         cap_.release();
-        RCLCPP_INFO(this->get_logger(), "Camera stopped");
     }
 
 private:
     cv::VideoCapture cap_;
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr publisher_;
     std::thread capture_thread_;
     std::thread publish_thread_;
     std::atomic<bool> running_;
@@ -82,21 +72,19 @@ private:
     std::mutex frame_mutex_;
     cv::Mat latest_frame_;
     int target_fps_;
+    int jpeg_quality_;
 
     void capture_loop()
     {
         cv::Mat frame;
         while (running_ && rclcpp::ok()) {
-            if (!cap_.grab()) {
+            if (!cap_.read(frame) || frame.empty()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
-            if (!cap_.retrieve(frame) || frame.empty())
-                continue;
-
             {
                 std::lock_guard<std::mutex> lock(frame_mutex_);
-                frame.copyTo(latest_frame_);   // только последний кадр
+                frame.copyTo(latest_frame_);
                 frame_ready_ = true;
             }
         }
@@ -104,12 +92,18 @@ private:
 
     void publish_loop()
     {
-        const auto period = std::chrono::microseconds(1000000 / target_fps_);
+        const auto period = std::chrono::microseconds(1000000 / std::max(1, target_fps_));
         auto next_time = std::chrono::steady_clock::now();
 
-        sensor_msgs::msg::Image msg;
-        msg.encoding = "bgr8";
-        msg.is_bigendian = false;
+        std::vector<uchar> buf;
+        std::vector<int> params = {
+            cv::IMWRITE_JPEG_QUALITY, jpeg_quality_,
+            cv::IMWRITE_JPEG_OPTIMIZE, 0,
+            cv::IMWRITE_JPEG_PROGRESSIVE, 0
+        };
+
+        sensor_msgs::msg::CompressedImage msg;
+        msg.format = "jpeg";
         msg.header.frame_id = "camera";
 
         int count = 0;
@@ -127,19 +121,20 @@ private:
                 latest_frame_.copyTo(frame);
             }
 
-            msg.height = static_cast<uint32_t>(frame.rows);
-            msg.width  = static_cast<uint32_t>(frame.cols);
-            msg.step   = static_cast<uint32_t>(frame.step);
-            msg.data.assign(frame.datastart, frame.dataend);
+            buf.clear();
+            if (!cv::imencode(".jpg", frame, buf, params) || buf.empty())
+                continue;
+
             msg.header.stamp = this->now();
+            msg.data = buf;   // уже готовый JPEG
 
             publisher_->publish(msg);
 
             ++count;
             auto now = this->now();
             if ((now - last_log).seconds() >= 1.0) {
-                RCLCPP_INFO(this->get_logger(), "Camera publish FPS: %d (size %dx%d)",
-                            count, frame.cols, frame.rows);
+                RCLCPP_INFO(this->get_logger(), "Camera FPS: %d | JPEG ~%zu bytes",
+                            count, buf.size());
                 count = 0;
                 last_log = now;
             }
