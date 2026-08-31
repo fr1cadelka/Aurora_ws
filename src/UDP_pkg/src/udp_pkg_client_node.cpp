@@ -49,7 +49,7 @@ public:
         }
 
         cv::namedWindow("Video", cv::WINDOW_NORMAL);
-        cv::resizeWindow("Video", 800, 450);
+        cv::resizeWindow("Video", 1080, 720);
 
         recv_thread_ = std::thread(&FastUdpClient::receive_loop, this);
 
