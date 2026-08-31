@@ -51,6 +51,7 @@ Desktop.ini
 *.tmp
 *.temp
 *.cache
+*.bin
 
 # CMake build directories (if you build inside src)
 CMakeLists.txt.user
