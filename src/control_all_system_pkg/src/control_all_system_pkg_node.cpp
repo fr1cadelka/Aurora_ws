@@ -6,6 +6,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -48,7 +49,7 @@ int getch_nonblock() {
 
 class UnifiedController : public rclcpp::Node {
 public:
-    UnifiedController() : Node("unified_controller"), running_(true) {
+    UnifiedController() : Node("unified_controller"), running_(true), auto_mode_(false) {
         // Параметры тележки
         this->declare_parameter<int>("manual_speed_step", 50);
         this->declare_parameter<int>("cruise_speed_pwm", 1500);
@@ -135,6 +136,11 @@ public:
             camera_cmd_topic_, 10,
             std::bind(&UnifiedController::cameraCmdCallback, this, std::placeholders::_1));
 
+        // Подписка на топик от LineFollower
+        auto_twist_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/line_follower/cmd_vel", 10,
+            std::bind(&UnifiedController::autoTwistCallback, this, std::placeholders::_1));
+
         // Публикаторы
         gimbal_pub_ = this->create_publisher<mavros_msgs::msg::GimbalManagerSetPitchyaw>(gimbal_topic_, 10);
         angle_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(angle_publish_topic_, 10);
@@ -159,6 +165,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "📷 Камера: %s", camera_cmd_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "📊 Статус: %s", status_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "⚙️ TCP таймаут: %d мс, клавиатура: %d мс", tcp_timeout_ms_, keyboard_timeout_ms_);
+        RCLCPP_INFO(this->get_logger(), "🔄 Автономный режим: ВЫКЛ");
         RCLCPP_INFO(this->get_logger(), "========================================");
         printHelp();
     }
@@ -172,6 +179,16 @@ public:
     }
 
 private:
+    // ================= НОВОЕ ДЛЯ АВТОНОМА =================
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr auto_twist_sub_;
+    geometry_msgs::msg::Twist last_auto_twist_;
+    std::atomic<bool> auto_mode_;
+
+    void autoTwistCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
+        last_auto_twist_ = *msg;
+    }
+    // =====================================================
+
     int getCruiseSpeed() {
         return neutral_pwm_ + manual_speed_step_;
     }
@@ -184,7 +201,7 @@ private:
         std::cout << "\n=== УПРАВЛЕНИЕ ===" << std::endl;
         std::cout << "🚜 Тележка: W/S - вперед/назад, A/D - влево/вправо" << std::endl;
         std::cout << "   Q - круиз вперед, E - круиз назад, R/F - скорость" << std::endl;
-        std::cout << "   SPACE - стоп" << std::endl;
+        std::cout << "   SPACE - стоп, M - автономный режим (вкл/выкл)" << std::endl;  // добавлено
         std::cout << "📷 Камера: СТРЕЛКИ - наклон/поворот" << std::endl;
         std::cout << "   Z/X/C - зум +/-/стоп, 1/2 - видеопоток" << std::endl;
         std::cout << "⚙️ +/- - шаг угла, H - справка, ESC - выход\n" << std::endl;
@@ -198,6 +215,7 @@ private:
                   << " | руль: лево=" << steering_left_pwm_
                   << " право=" << steering_right_pwm_
                   << (is_tcp_mode_ ? " [TCP]" : " [KB]")
+                  << (auto_mode_ ? " [AUTO]" : "")
                   << "        " << std::flush;
     }
 
@@ -209,7 +227,8 @@ private:
            << " B=" << getCruiseSpeedBackward()
            << " | руль: лево=" << steering_left_pwm_
            << " право=" << steering_right_pwm_
-           << (is_tcp_mode_ ? " [TCP]" : " [KB]");
+           << (is_tcp_mode_ ? " [TCP]" : " [KB]")
+           << (auto_mode_ ? " [AUTO]" : "");
 
         auto msg = std_msgs::msg::String();
         msg.data = ss.str();
@@ -290,6 +309,19 @@ private:
             angular_steering_ = neutral_pwm_;
             is_tcp_mode_ = false;
             std::cout << "\r[TCP] СТОП     " << std::flush;
+        }
+        // ===== НОВЫЕ TCP-команды для автонома =====
+        else if (cmd == "auto_on") {
+            auto_mode_ = true;
+            cruise_control_active_ = false;
+            cruise_control_backward_ = false;
+            linear_throttle_ = neutral_pwm_;
+            angular_steering_ = neutral_pwm_;
+            std::cout << "\n[Автоном] ВКЛЮЧЕН по TCP" << std::endl;
+        }
+        else if (cmd == "auto_off") {
+            auto_mode_ = false;
+            std::cout << "\n[Автоном] ВЫКЛЮЧЕН по TCP" << std::endl;
         }
     }
 
@@ -498,6 +530,21 @@ private:
             std::cout << "\r📐 Шаг угла: " << step_ << "°     " << std::flush;
             break;
 
+        // ===== НОВАЯ КЛАВИША ДЛЯ АВТОНОМА =====
+        case 'm': case 'M':
+            auto_mode_ = !auto_mode_;
+            if (auto_mode_) {
+                std::cout << "\n[Автоном] ВКЛЮЧЕН" << std::endl;
+                // Сбрасываем ручное управление
+                cruise_control_active_ = false;
+                cruise_control_backward_ = false;
+                linear_throttle_ = neutral_pwm_;
+                angular_steering_ = neutral_pwm_;
+            } else {
+                std::cout << "\n[Автоном] ВЫКЛЮЧЕН" << std::endl;
+            }
+            break;
+
         case 'h': case 'H':
             printHelp();
             break;
@@ -513,6 +560,30 @@ private:
     void telegaControlLoop() {
         if (!is_connected_) return;
 
+        // ===== НОВАЯ ВЕТКА АВТОНОМНОГО РЕЖИМА =====
+        if (auto_mode_) {
+            double linear = last_auto_twist_.linear.x;    // 0 или cruise_speed
+            double angular = last_auto_twist_.angular.z;  // -1..1
+
+            // Преобразование скорости в PWM (коэффициент подберите под свои нужды)
+            // Для начала: linear=0.5 -> +50 PWM, linear=-0.5 -> -50 PWM
+            int linear_offset = static_cast<int>(linear * 100);
+            linear_offset = std::clamp(linear_offset, -(neutral_pwm_ - 1000), 2000 - neutral_pwm_);
+            int current_linear = neutral_pwm_ + linear_offset;
+
+            int max_steer_offset = steering_right_pwm_ - neutral_pwm_; // примерно 150
+            int steer_offset = static_cast<int>(angular * max_steer_offset);
+            steer_offset = std::clamp(steer_offset, -max_steer_offset, max_steer_offset);
+
+            int pwm_motor1 = std::clamp(current_linear + steer_offset, 1000, 2000);
+            int pwm_motor2 = std::clamp(current_linear - steer_offset, 1000, 2000);
+
+            sendServoCommand(1, pwm_motor1);
+            sendServoCommand(2, pwm_motor2);
+            return; // выходим, чтобы не выполнять ручное управление
+        }
+
+        // ===== СУЩЕСТВУЮЩЕЕ РУЧНОЕ УПРАВЛЕНИЕ =====
         auto current_time = this->now();
 
         int timeout_ms = is_tcp_mode_ ? tcp_timeout_ms_ : keyboard_timeout_ms_;

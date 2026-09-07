@@ -29,14 +29,31 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
+
 add_executable(${PROJECT_NAME}_node src/${PROJECT_NAME}_node.cpp)
 ament_target_dependencies(${PROJECT_NAME}_node
-rclcpp
-sensor_msgs
-cv_bridge
-OpenCV
-geometry_msgs
-mavros_msgs )
-install(TARGETS ${PROJECT_NAME}_node
-DESTINATION lib/${PROJECT_NAME})
-ament_package()
+  rclcpp
+  sensor_msgs
+  cv_bridge
+  OpenCV
+  geometry_msgs
+  mavros_msgs
+)
+
+# Новый узел line_follower
+add_executable(line_follower_node src/line_follower_node.cpp)
+ament_target_dependencies(line_follower_node
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  cv_bridge
+  OpenCV
+  mavros_msgs
+)
+
+# Установка обоих
+install(TARGETS
+  ${PROJECT_NAME}_node
+  line_follower_node
+  DESTINATION lib/${PROJECT_NAME}
+)
