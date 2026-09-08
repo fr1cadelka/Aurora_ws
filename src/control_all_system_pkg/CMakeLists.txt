@@ -57,3 +57,5 @@ install(TARGETS
   line_follower_node
   DESTINATION lib/${PROJECT_NAME}
 )
+
+ament_package()
