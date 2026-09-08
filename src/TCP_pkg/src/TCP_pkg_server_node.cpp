@@ -106,7 +106,7 @@ public:
         // ============================================
         // 1. ПАРАМЕТРЫ
         // ============================================
-        this->declare_parameter("server_ip", "0.0.0.0");
+        this->declare_parameter("server_ip", "192.168.10.101");
         this->declare_parameter("server_port", 6000);
         this->declare_parameter("max_clients", 10);
         this->declare_parameter("gimbal_topic", "/gimbal/commands");
@@ -172,7 +172,7 @@ public:
 
         angle_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "/server_received/angles", 10);
-        log_info("  ✅ Публикация углов: /server_received/angles");
+        log_info("  ✅ Публикация углов: /serveserver_ip:=192.168.10.100r_received/angles");
 
         camera_cmd_pub_ = this->create_publisher<std_msgs::msg::String>(
             camera_cmd_topic_, 10);
