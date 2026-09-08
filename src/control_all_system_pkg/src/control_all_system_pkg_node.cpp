@@ -63,6 +63,9 @@ public:
         this->declare_parameter<int>("tcp_timeout_ms", 800);
         this->declare_parameter<int>("keyboard_timeout_ms", 200);
 
+        // === НОВЫЙ ПАРАМЕТР ДЛЯ АВТОНОМНОГО РЕЖИМА ===
+        this->declare_parameter<int>("auto_cruise_pwm", 1625);
+
         manual_speed_step_ = this->get_parameter("manual_speed_step").as_int();
         cruise_speed_pwm_ = this->get_parameter("cruise_speed_pwm").as_int();
         cruise_speed_pwm_backward_ = this->get_parameter("cruise_speed_pwm_backward").as_int();
@@ -74,6 +77,8 @@ public:
 
         tcp_timeout_ms_ = this->get_parameter("tcp_timeout_ms").as_int();
         keyboard_timeout_ms_ = this->get_parameter("keyboard_timeout_ms").as_int();
+
+        auto_cruise_pwm_ = this->get_parameter("auto_cruise_pwm").as_int(); // чтение нового параметра
 
         // Параметры камеры
         this->declare_parameter<std::string>("gimbal_topic", "/gimbal/commands");
@@ -136,7 +141,7 @@ public:
             camera_cmd_topic_, 10,
             std::bind(&UnifiedController::cameraCmdCallback, this, std::placeholders::_1));
 
-        // Подписка на топик от LineFollower
+        // Подписка на топик от LineFollower (оставлена, но в автономе не используется)
         auto_twist_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/line_follower/cmd_vel", 10,
             std::bind(&UnifiedController::autoTwistCallback, this, std::placeholders::_1));
@@ -166,6 +171,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "📊 Статус: %s", status_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "⚙️ TCP таймаут: %d мс, клавиатура: %d мс", tcp_timeout_ms_, keyboard_timeout_ms_);
         RCLCPP_INFO(this->get_logger(), "🔄 Автономный режим: ВЫКЛ");
+        RCLCPP_INFO(this->get_logger(), "🚀 Скорость автонома (PWM): %d", auto_cruise_pwm_);
         RCLCPP_INFO(this->get_logger(), "========================================");
         printHelp();
     }
@@ -181,11 +187,12 @@ public:
 private:
     // ================= НОВОЕ ДЛЯ АВТОНОМА =================
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr auto_twist_sub_;
-    geometry_msgs::msg::Twist last_auto_twist_;
+    geometry_msgs::msg::Twist last_auto_twist_; // не используется, но оставлено для совместимости
     std::atomic<bool> auto_mode_;
+    int auto_cruise_pwm_; // новый параметр
 
     void autoTwistCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
-        last_auto_twist_ = *msg;
+        last_auto_twist_ = *msg; // просто сохраняем, но не используем
     }
     // =====================================================
 
@@ -201,7 +208,7 @@ private:
         std::cout << "\n=== УПРАВЛЕНИЕ ===" << std::endl;
         std::cout << "🚜 Тележка: W/S - вперед/назад, A/D - влево/вправо" << std::endl;
         std::cout << "   Q - круиз вперед, E - круиз назад, R/F - скорость" << std::endl;
-        std::cout << "   SPACE - стоп, M - автономный режим (вкл/выкл)" << std::endl;  // добавлено
+        std::cout << "   SPACE - стоп, M - автономный режим (вкл/выкл)" << std::endl;
         std::cout << "📷 Камера: СТРЕЛКИ - наклон/поворот" << std::endl;
         std::cout << "   Z/X/C - зум +/-/стоп, 1/2 - видеопоток" << std::endl;
         std::cout << "⚙️ +/- - шаг угла, H - справка, ESC - выход\n" << std::endl;
@@ -530,12 +537,10 @@ private:
             std::cout << "\r📐 Шаг угла: " << step_ << "°     " << std::flush;
             break;
 
-        // ===== НОВАЯ КЛАВИША ДЛЯ АВТОНОМА =====
         case 'm': case 'M':
             auto_mode_ = !auto_mode_;
             if (auto_mode_) {
                 std::cout << "\n[Автоном] ВКЛЮЧЕН" << std::endl;
-                // Сбрасываем ручное управление
                 cruise_control_active_ = false;
                 cruise_control_backward_ = false;
                 linear_throttle_ = neutral_pwm_;
@@ -562,28 +567,18 @@ private:
 
         // ===== НОВАЯ ВЕТКА АВТОНОМНОГО РЕЖИМА =====
         if (auto_mode_) {
-            double linear = last_auto_twist_.linear.x;    // 0 или cruise_speed
-            double angular = last_auto_twist_.angular.z;  // -1..1
-
-            // Преобразование скорости в PWM (коэффициент подберите под свои нужды)
-            // Для начала: linear=0.5 -> +50 PWM, linear=-0.5 -> -50 PWM
-            int linear_offset = static_cast<int>(linear * 100);
-            linear_offset = std::clamp(linear_offset, -(neutral_pwm_ - 1000), 2000 - neutral_pwm_);
-            int current_linear = neutral_pwm_ + linear_offset;
-
-            int max_steer_offset = steering_right_pwm_ - neutral_pwm_; // примерно 150
-            int steer_offset = static_cast<int>(angular * max_steer_offset);
-            steer_offset = std::clamp(steer_offset, -max_steer_offset, max_steer_offset);
-
-            int pwm_motor1 = std::clamp(current_linear + steer_offset, 1000, 2000);
-            int pwm_motor2 = std::clamp(current_linear - steer_offset, 1000, 2000);
-
+            // Фиксированная линейная скорость (низкие обороты)
+            int current_linear = auto_cruise_pwm_;
+            // Угловая скорость – из angular_steering_ (устанавливается командами A/D или LEFT/RIGHT)
+            int steering_offset = angular_steering_ - neutral_pwm_;
+            int pwm_motor1 = std::clamp(current_linear + steering_offset, 1000, 2000);
+            int pwm_motor2 = std::clamp(current_linear - steering_offset, 1000, 2000);
             sendServoCommand(1, pwm_motor1);
             sendServoCommand(2, pwm_motor2);
             return; // выходим, чтобы не выполнять ручное управление
         }
 
-        // ===== СУЩЕСТВУЮЩЕЕ РУЧНОЕ УПРАВЛЕНИЕ =====
+        // ===== СУЩЕСТВУЮЩЕЕ РУЧНОЕ УПРАВЛЕНИЕ (без изменений) =====
         auto current_time = this->now();
 
         int timeout_ms = is_tcp_mode_ ? tcp_timeout_ms_ : keyboard_timeout_ms_;
