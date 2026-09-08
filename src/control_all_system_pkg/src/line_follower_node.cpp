@@ -58,22 +58,26 @@ private:
     // ===== ПАРАМЕТРЫ =====
     double kp_ = 0.5, ki_ = 0.0, kd_ = 0.1;
     double cruise_speed_ = 0.3;
-    double roi_top_ratio_ = 0.4;
+    double roi_top_ratio_ = 0.6;
+    double roi_left_ratio_ = 0.0;   // Обрезание слева (0-0.5)
+    double roi_right_ratio_ = 0.0;  // Обрезание справа (0-0.5)
     int lost_timeout_ms_ = 3000;
     bool debug_ = true;
 
     // HSV параметры
-    int low_h1_ = 0, high_h1_ = 20;
-    int low_h2_ = 160, high_h2_ = 179;
-    int low_s_ = 80, high_s_ = 255;
-    int low_v_ = 80, high_v_ = 255;
-    int min_area_ = 500;
+    int low_h1_ = 0, high_h1_ = 179;
+    int low_h2_ = 0, high_h2_ = 179;
+    int low_s_ = 81, high_s_ = 255;
+    int low_v_ = 145, high_v_ = 255;
+    int min_area_ = 40;
     int min_aspect_ = 30;
 
     // ===== ПЕРЕМЕННЫЕ ДЛЯ ТРЕКБАРОВ =====
     int track_kp_ = 50, track_ki_ = 0, track_kd_ = 10;
     int track_cruise_speed_ = 30;
-    int track_roi_top_ratio_ = 40;
+    int track_roi_top_ratio_ = 60;
+    int track_roi_left_ratio_ = 0;    // 0-50 (% от ширины)
+    int track_roi_right_ratio_ = 0;   // 0-50 (% от ширины)
     int track_low_h1_ = 0, track_high_h1_ = 20;
     int track_low_h2_ = 160, track_high_h2_ = 179;
     int track_low_s_ = 80, track_high_s_ = 255;
@@ -100,19 +104,21 @@ private:
         this->declare_parameter("ki", 0.0);
         this->declare_parameter("kd", 0.1);
         this->declare_parameter("cruise_speed", 0.3);
-        this->declare_parameter("roi_top_ratio", 0.4);
+        this->declare_parameter("roi_top_ratio", 0.6);
+        this->declare_parameter("roi_left_ratio", 0.0);
+        this->declare_parameter("roi_right_ratio", 0.0);
         this->declare_parameter("lost_timeout_ms", 3000);
         this->declare_parameter("debug", true);
 
         this->declare_parameter("hue_low1", 0);
-        this->declare_parameter("hue_high1", 20);
-        this->declare_parameter("hue_low2", 160);
+        this->declare_parameter("hue_high1", 180);
+        this->declare_parameter("hue_low2", 0);
         this->declare_parameter("hue_high2", 179);
-        this->declare_parameter("sat_low", 80);
+        this->declare_parameter("sat_low", 81);
         this->declare_parameter("sat_high", 255);
-        this->declare_parameter("val_low", 80);
+        this->declare_parameter("val_low", 145);
         this->declare_parameter("val_high", 255);
-        this->declare_parameter("min_area", 500);
+        this->declare_parameter("min_area", 40);
         this->declare_parameter("min_aspect", 30);
     }
 
@@ -122,6 +128,8 @@ private:
         kd_ = this->get_parameter("kd").as_double();
         cruise_speed_ = this->get_parameter("cruise_speed").as_double();
         roi_top_ratio_ = this->get_parameter("roi_top_ratio").as_double();
+        roi_left_ratio_ = this->get_parameter("roi_left_ratio").as_double();
+        roi_right_ratio_ = this->get_parameter("roi_right_ratio").as_double();
         lost_timeout_ms_ = this->get_parameter("lost_timeout_ms").as_int();
         debug_ = this->get_parameter("debug").as_bool();
 
@@ -146,6 +154,8 @@ private:
         track_kd_ = static_cast<int>(kd_ * 100);
         track_cruise_speed_ = static_cast<int>(cruise_speed_ * 100);
         track_roi_top_ratio_ = static_cast<int>(roi_top_ratio_ * 100);
+        track_roi_left_ratio_ = static_cast<int>(roi_left_ratio_ * 100);
+        track_roi_right_ratio_ = static_cast<int>(roi_right_ratio_ * 100);
         track_low_h1_ = low_h1_;
         track_high_h1_ = high_h1_;
         track_low_h2_ = low_h2_;
@@ -164,6 +174,8 @@ private:
         kd_ = track_kd_ / 100.0;
         cruise_speed_ = track_cruise_speed_ / 100.0;
         roi_top_ratio_ = track_roi_top_ratio_ / 100.0;
+        roi_left_ratio_ = track_roi_left_ratio_ / 100.0;
+        roi_right_ratio_ = track_roi_right_ratio_ / 100.0;
         low_h1_ = track_low_h1_;
         high_h1_ = track_high_h1_;
         low_h2_ = track_low_h2_;
@@ -178,7 +190,7 @@ private:
 
     void create_control_window() {
         cv::namedWindow("Controls", cv::WINDOW_NORMAL);
-        cv::resizeWindow("Controls", 400, 700);
+        cv::resizeWindow("Controls", 400, 750);
         cv::moveWindow("Controls", 0, 0);
 
         // HSV параметры
@@ -195,21 +207,44 @@ private:
         cv::createTrackbar("Min Area", "Controls", &track_min_area_, 5000);
         cv::createTrackbar("Min Aspect*10", "Controls", &track_min_aspect_, 100);
 
+        // ROI параметры
+        cv::createTrackbar("ROI Top %", "Controls", &track_roi_top_ratio_, 90);
+        cv::createTrackbar("ROI Left %", "Controls", &track_roi_left_ratio_, 50);
+        cv::createTrackbar("ROI Right %", "Controls", &track_roi_right_ratio_, 50);
+
         // PID
         cv::createTrackbar("Kp*100", "Controls", &track_kp_, 200);
         cv::createTrackbar("Ki*100", "Controls", &track_ki_, 100);
         cv::createTrackbar("Kd*100", "Controls", &track_kd_, 200);
 
-        // Скорость и ROI
+        // Скорость
         cv::createTrackbar("Cruise Speed*100", "Controls", &track_cruise_speed_, 100);
-        cv::createTrackbar("ROI Top %", "Controls", &track_roi_top_ratio_, 90);
 
         RCLCPP_INFO(this->get_logger(), "Control window created with all sliders");
     }
 
     cv::Mat get_roi(const cv::Mat& frame) {
-        int roi_top = static_cast<int>(frame.rows * roi_top_ratio_);
-        return frame(cv::Rect(0, roi_top, frame.cols, frame.rows - roi_top));
+        int height = frame.rows;
+        int width = frame.cols;
+
+        // Обрезаем сверху
+        int roi_top = static_cast<int>(height * roi_top_ratio_);
+
+        // Обрезаем слева и справа
+        int roi_left = static_cast<int>(width * roi_left_ratio_);
+        int roi_right = static_cast<int>(width * roi_right_ratio_);
+
+        // Вычисляем ширину ROI
+        int roi_width = width - roi_left - roi_right;
+
+        // Проверяем, чтобы ширина была положительной
+        if (roi_width <= 0) {
+            roi_width = width;
+            roi_left = 0;
+            roi_right = 0;
+        }
+
+        return frame(cv::Rect(roi_left, roi_top, roi_width, height - roi_top));
     }
 
     void publish_image(const cv::Mat& img, const std::string& encoding,
@@ -367,6 +402,11 @@ private:
             cv::putText(debug_frame, "Ang: " + std::to_string(angular),
                         cv::Point(10, 120), cv::FONT_HERSHEY_SIMPLEX, 0.7,
                         cv::Scalar(255, 255, 255), 2);
+            cv::putText(debug_frame, "ROI: T=" + std::to_string((int)(roi_top_ratio_*100)) +
+                                         "% L=" + std::to_string((int)(roi_left_ratio_*100)) +
+                                         "% R=" + std::to_string((int)(roi_right_ratio_*100)) + "%",
+                        cv::Point(10, 150), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                        cv::Scalar(200, 200, 200), 1);
 
             publish_image(debug_frame, "bgr8", debug_image_pub_);
         }
@@ -382,3 +422,4 @@ int main(int argc, char **argv) {
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
+}
