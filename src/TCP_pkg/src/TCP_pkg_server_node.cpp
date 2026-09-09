@@ -1,6 +1,4 @@
 #include <rclcpp/rclcpp.hpp>
-#include <mavros_msgs/msg/gimbal_manager_set_pitchyaw.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -18,7 +16,6 @@
 #include <iomanip>
 #include <map>
 #include <chrono>
-#include <regex>
 #include <algorithm>
 #include <termios.h>
 #include <ifaddrs.h>
@@ -28,13 +25,12 @@
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ЦВЕТА, ЛОГИ)
 // ============================================
 #define COLOR_RESET   "\033[0m"
-#define COLOR_RED     "\033[31m"
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_MAGENTA "\033[35m"
+#define COLOR_RED     "\033[31m"
 #define COLOR_CYAN    "\033[36m"
-#define COLOR_BOLD    "\033[1m"
+#define COLOR_MAGENTA "\033[35m"
+#define COLOR_BLUE    "\033[34m"
 
 std::string get_timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -62,11 +58,9 @@ void log_error(const std::string& msg) {
               << COLOR_RESET << msg << std::endl;
 }
 
-void log_debug(const std::string& msg) {
-    std::cout << COLOR_CYAN << "[" << get_timestamp() << "] [DEBUG] "
-              << COLOR_RESET << msg << std::endl;
-}
-
+// ============================================
+// НЕБЛОКИРУЮЩЕЕ ЧТЕНИЕ КЛАВИШ
+// ============================================
 int getch_nonblock() {
     static struct termios oldt, newt;
     static bool initialized = false;
@@ -93,122 +87,45 @@ int getch_nonblock() {
     return ch;
 }
 
+// ============================================
+// TCP СЕРВЕР
+// ============================================
 class TcpServerNode : public rclcpp::Node {
 public:
     TcpServerNode() : Node("tcp_server_node"),
         server_fd_(-1),
         running_(true),
-        command_count_(0),
-        auto_mode_state_(false)   // <-- НОВОЕ: состояние автономного режима
+        command_count_(0)
     {
         log_info("========================================");
-        log_info("🌐 TCP СЕРВЕР ДЛЯ РОВЕРА");
+        log_info("🌐 TCP СЕРВЕР (VESC)");
         log_info("========================================");
 
-        // ============================================
-        // 1. ПАРАМЕТРЫ
-        // ============================================
+        // Параметры
         this->declare_parameter("server_ip", "127.0.0.1");
         this->declare_parameter("server_port", 6000);
         this->declare_parameter("max_clients", 10);
-        this->declare_parameter("gimbal_topic", "/gimbal/commands");
-        this->declare_parameter("teleop_topic", "/teleop/data");
-        this->declare_parameter("key_topic", "/teleop/key");
-        this->declare_parameter("keyboard_commands_topic", "/keyboard_commands");
-        this->declare_parameter("camera_cmd_topic", "/camera_control");
-        this->declare_parameter("telega_cmd_topic", "/telega_commands");
 
         server_ip_ = this->get_parameter("server_ip").as_string();
         server_port_ = this->get_parameter("server_port").as_int();
         max_clients_ = this->get_parameter("max_clients").as_int();
-        gimbal_topic_ = this->get_parameter("gimbal_topic").as_string();
-        teleop_topic_ = this->get_parameter("teleop_topic").as_string();
-        key_topic_ = this->get_parameter("key_topic").as_string();
-        keyboard_commands_topic_ = this->get_parameter("keyboard_commands_topic").as_string();
-        camera_cmd_topic_ = this->get_parameter("camera_cmd_topic").as_string();
-        telega_cmd_topic_ = this->get_parameter("telega_cmd_topic").as_string();
 
         log_info("📋 ПАРАМЕТРЫ:");
         log_info("  server_ip: " + server_ip_);
         log_info("  server_port: " + std::to_string(server_port_));
         log_info("  max_clients: " + std::to_string(max_clients_));
-        log_info("  gimbal_topic: " + gimbal_topic_);
-        log_info("  teleop_topic: " + teleop_topic_);
-        log_info("  key_topic: " + key_topic_);
-        log_info("  camera_cmd_topic: " + camera_cmd_topic_);
-        log_info("  telega_cmd_topic: " + telega_cmd_topic_);
 
-        // ============================================
-        // 2. ПОДПИСЧИКИ
-        // ============================================
-        log_info("========================================");
-        log_info("📋 НАСТРОЙКА ПОДПИСЧИКОВ");
-        log_info("========================================");
-
-        gimbal_sub_ = this->create_subscription<mavros_msgs::msg::GimbalManagerSetPitchyaw>(
-            gimbal_topic_, 10,
-            std::bind(&TcpServerNode::gimbal_callback, this, std::placeholders::_1));
-        log_info("  ✅ Подписка на камеру: " + gimbal_topic_);
-
-        teleop_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
-            teleop_topic_, 10,
-            std::bind(&TcpServerNode::teleop_callback, this, std::placeholders::_1));
-        log_info("  ✅ Подписка на тележку: " + teleop_topic_);
-
-        key_sub_ = this->create_subscription<std_msgs::msg::String>(
-            key_topic_, 10,
-            std::bind(&TcpServerNode::key_callback, this, std::placeholders::_1));
-        log_info("  ✅ Подписка на клавиши: " + key_topic_);
-
-        keyboard_commands_sub_ = this->create_subscription<std_msgs::msg::String>(
-            keyboard_commands_topic_, 10,
-            std::bind(&TcpServerNode::keyboard_commands_callback, this, std::placeholders::_1));
-        log_info("  ✅ Подписка на команды клавиатуры: " + keyboard_commands_topic_);
-
-        // ============================================
-        // 3. ПУБЛИКАТОРЫ
-        // ============================================
-        log_info("========================================");
-        log_info("📤 НАСТРОЙКА ПУБЛИКАТОРОВ");
-        log_info("========================================");
-
-        angle_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
-            "/server_received/angles", 10);
-        log_info("  ✅ Публикация углов: /server_received/angles");
-
-        camera_cmd_pub_ = this->create_publisher<std_msgs::msg::String>(
-            camera_cmd_topic_, 10);
-        log_info("  ✅ Публикация команд камеры: " + camera_cmd_topic_);
-
-        telega_cmd_pub_ = this->create_publisher<std_msgs::msg::String>(
-            telega_cmd_topic_, 10);
-        log_info("  ✅ Публикация команд тележки: " + telega_cmd_topic_);
-
-        // ============================================
-        // 4. ЗАПУСК TCP-СЕРВЕРА
-        // ============================================
-        log_info("========================================");
-        log_info("🌐 ЗАПУСК TCP-СЕРВЕРА");
-        log_info("========================================");
-
+        // Запуск сервера
         if (!start_server(server_ip_, server_port_)) {
             log_error("❌ Не удалось запустить сервер");
             return;
         }
 
-        // ============================================
-        // 5. ЗАПУСК ПОТОКОВ
-        // ============================================
-        log_info("📋 ЗАПУСК ПОТОКОВ");
-        log_info("  ✅ Поток чтения клиентов");
+        // Потоки
         read_thread_ = std::thread(&TcpServerNode::read_from_clients, this);
-
-        log_info("  ✅ Поток клавиатуры");
         keyboard_thread_ = std::thread(&TcpServerNode::read_keyboard, this);
 
-        // ============================================
-        // 6. ТАЙМЕР ДЛЯ СТАТИСТИКИ (каждые 15 секунд)
-        // ============================================
+        // Таймер статистики
         stats_timer_ = this->create_wall_timer(
             std::chrono::seconds(15),
             std::bind(&TcpServerNode::print_stats, this));
@@ -216,14 +133,13 @@ public:
         last_activity_time_ = std::chrono::steady_clock::now();
 
         log_info("========================================");
-        log_info(COLOR_GREEN "✅ TCP-СЕРВЕР УСПЕШНО ЗАПУЩЕН" COLOR_RESET);
+        log_info(COLOR_GREEN "✅ TCP-СЕРВЕР ЗАПУЩЕН" COLOR_RESET);
         log_info("  🌐 IP: " + server_ip_);
         log_info("  🔌 Порт: " + std::to_string(server_port_));
-        log_info("  🖥️  Макс. клиентов: " + std::to_string(max_clients_));
-        log_info("  ⌨️  Управление с клавиатуры сервера");
+        log_info("  ⌨️  Управление: WASD, Q(круиз), E(ARM), R/F(скорость), ПРОБЕЛ(стоп)");
         log_info("========================================");
         log_info("");
-        log_info("💡 Нажмите Ctrl+C для остановки сервера");
+        log_info("💡 Нажмите Ctrl+C для остановки");
         log_info("");
     }
 
@@ -231,246 +147,74 @@ public:
         log_warn("🛑 ОСТАНОВКА СЕРВЕРА...");
         running_ = false;
 
-        if (read_thread_.joinable()) {
-            read_thread_.join();
-        }
-
-        if (keyboard_thread_.joinable()) {
-            keyboard_thread_.join();
-        }
-
-        if (accept_thread_.joinable()) {
-            accept_thread_.join();
-        }
+        if (read_thread_.joinable()) read_thread_.join();
+        if (keyboard_thread_.joinable()) keyboard_thread_.join();
+        if (accept_thread_.joinable()) accept_thread_.join();
 
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (int client : clients_) {
-                if (client != -1) {
-                    close(client);
-                }
+                if (client != -1) close(client);
             }
             clients_.clear();
         }
 
-        if (server_fd_ != -1) {
-            close(server_fd_);
-        }
-
-        tcgetattr(STDIN_FILENO, &old_termios_);
-
+        if (server_fd_ != -1) close(server_fd_);
         log_info("📊 ВСЕГО КОМАНД: " + std::to_string(command_count_));
         log_info("✅ Сервер остановлен");
     }
 
 private:
     // ============================================
-    // ЧТЕНИЕ КЛАВИАТУРЫ НА СЕРВЕРЕ
+    // ЧТЕНИЕ КЛАВИАТУРЫ
     // ============================================
     void read_keyboard() {
         std::cout << COLOR_CYAN << "\n========================================" << std::endl;
-        std::cout << "УПРАВЛЕНИЕ С КЛАВИАТУРЫ СЕРВЕРА:" << std::endl;
-        std::cout << "========================================" << std::endl;
-        std::cout << "🚜 ТЕЛЕЖКА:" << std::endl;
+        std::cout << "УПРАВЛЕНИЕ ТЕЛЕЖКОЙ (VESC):" << std::endl;
         std::cout << "  W/S - Вперёд/Назад" << std::endl;
         std::cout << "  A/D - Налево/Направо" << std::endl;
-        std::cout << "  Q   - Круиз-контроль (вперед)" << std::endl;
-        std::cout << "  E   - Круиз-контроль (назад)" << std::endl;  // добавлено
+        std::cout << "  Q   - Круиз-контроль (вкл/выкл)" << std::endl;
+        std::cout << "  E   - ARM / DISARM" << std::endl;
         std::cout << "  R/F - Увеличить/Уменьшить скорость" << std::endl;
-        std::cout << "  ПРОБЕЛ - Стоп" << std::endl;
-        std::cout << "  M   - Автономный режим (вкл/выкл)" << std::endl; // НОВОЕ
-        std::cout << "----------------------------------------" << std::endl;
-        std::cout << "📷 КАМЕРА:" << std::endl;
-        std::cout << "  СТРЕЛКИ - Наклон/Поворот" << std::endl;
-        std::cout << "  +/- - Приближение/Отдаление" << std::endl;
-        std::cout << "  Z/X/C - Зум +/-/Стоп" << std::endl;
-        std::cout << "  1/2 - Переключение видеопотока" << std::endl;
+        std::cout << "  ПРОБЕЛ - Аварийный стоп (DISARM)" << std::endl;
         std::cout << "========================================" << COLOR_RESET << std::endl;
-
-        std::string last_sent_command;
-        std::chrono::steady_clock::time_point last_sent_time;
 
         while (running_ && rclcpp::ok()) {
             int ch = getch_nonblock();
 
             if (ch == -1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
-            std::string ros_command;
-            std::string tcp_command;
-            bool send_to_tcp = true;
+            std::string command;
+            bool send = false;
 
             switch (ch) {
-            case 'w': case 'W':
-                ros_command = "w";
-                tcp_command = "KEY:W:press\n";
-                std::cout << COLOR_GREEN << "🚜 Вперёд" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 's': case 'S':
-                ros_command = "s";
-                tcp_command = "KEY:S:press\n";
-                std::cout << COLOR_GREEN << "🚜 Назад" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'a': case 'A':
-                ros_command = "a";
-                tcp_command = "KEY:A:press\n";
-                std::cout << COLOR_GREEN << "🚜 Налево" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'd': case 'D':
-                ros_command = "d";
-                tcp_command = "KEY:D:press\n";
-                std::cout << COLOR_GREEN << "🚜 Направо" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'q': case 'Q':
-                ros_command = "q";
-                tcp_command = "KEY:Q:press\n";
-                std::cout << COLOR_YELLOW << "🚜 Круиз-контроль вперёд" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'e': case 'E':   // добавлено для круиза назад
-                ros_command = "e";
-                tcp_command = "KEY:E:press\n";
-                std::cout << COLOR_YELLOW << "🚜 Круиз-контроль назад" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'r': case 'R':
-                ros_command = "r";
-                tcp_command = "KEY:R:press\n";
-                std::cout << COLOR_YELLOW << "🚜 Скорость +" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'f': case 'F':
-                ros_command = "f";
-                tcp_command = "KEY:F:press\n";
-                std::cout << COLOR_YELLOW << "🚜 Скорость -" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case ' ':
-                ros_command = " ";
-                tcp_command = "KEY:SPACE:press\n";
-                std::cout << COLOR_RED << "🚜 СТОП" << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'm': case 'M':   // <-- НОВЫЙ ОБРАБОТЧИК
-                auto_mode_state_ = !auto_mode_state_;
-                ros_command = auto_mode_state_ ? "auto_on" : "auto_off";
-                tcp_command = "TELEGA:" + ros_command + "\n";
-                std::cout << COLOR_YELLOW << "🔄 Автономный режим: "
-                          << (auto_mode_state_ ? "ВКЛ" : "ВЫКЛ") << COLOR_RESET << std::endl;
-                telega_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 27: {
-                int next = getch_nonblock();
-                if (next == 91) {
-                    int arrow = getch_nonblock();
-                    switch (arrow) {
-                    case 65:
-                        ros_command = "UP";
-                        tcp_command = "KEY:UP:press\n";
-                        std::cout << COLOR_BLUE << "📷 Наклон вверх" << COLOR_RESET << std::endl;
-                        camera_cmd_pub_->publish(create_string_msg(ros_command));
-                        break;
-                    case 66:
-                        ros_command = "DOWN";
-                        tcp_command = "KEY:DOWN:press\n";
-                        std::cout << COLOR_BLUE << "📷 Наклон вниз" << COLOR_RESET << std::endl;
-                        camera_cmd_pub_->publish(create_string_msg(ros_command));
-                        break;
-                    case 68:
-                        ros_command = "LEFT";
-                        tcp_command = "KEY:LEFT:press\n";
-                        std::cout << COLOR_BLUE << "📷 Поворот налево" << COLOR_RESET << std::endl;
-                        camera_cmd_pub_->publish(create_string_msg(ros_command));
-                        break;
-                    case 67:
-                        ros_command = "RIGHT";
-                        tcp_command = "KEY:RIGHT:press\n";
-                        std::cout << COLOR_BLUE << "📷 Поворот направо" << COLOR_RESET << std::endl;
-                        camera_cmd_pub_->publish(create_string_msg(ros_command));
-                        break;
-                    }
-                }
-                break;
-            }
-            case '+': case '=':
-                ros_command = "PLUS";
-                tcp_command = "KEY:PLUS:press\n";
-                std::cout << COLOR_BLUE << "📷 Приближение" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case '-': case '_':
-                ros_command = "MINUS";
-                tcp_command = "KEY:MINUS:press\n";
-                std::cout << COLOR_BLUE << "📷 Отдаление" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'z': case 'Z':
-                ros_command = "Z";
-                tcp_command = "KEY:Z:press\n";
-                std::cout << COLOR_BLUE << "📷 Зум +" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'x': case 'X':
-                ros_command = "X";
-                tcp_command = "KEY:X:press\n";
-                std::cout << COLOR_BLUE << "📷 Зум -" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case 'c': case 'C':
-                ros_command = "C";
-                tcp_command = "KEY:C:press\n";
-                std::cout << COLOR_BLUE << "📷 Стоп зум" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case '1':
-                ros_command = "1";
-                tcp_command = "KEY:1:press\n";
-                std::cout << COLOR_BLUE << "📷 Режим RGB" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            case '2':
-                ros_command = "2";
-                tcp_command = "KEY:2:press\n";
-                std::cout << COLOR_BLUE << "📷 Режим Wide/Thermal" << COLOR_RESET << std::endl;
-                camera_cmd_pub_->publish(create_string_msg(ros_command));
-                break;
-            default:
-                send_to_tcp = false;
-                break;
+            case 'w': case 'W': command = "w"; send = true; break;
+            case 's': case 'S': command = "s"; send = true; break;
+            case 'a': case 'A': command = "a"; send = true; break;
+            case 'd': case 'D': command = "d"; send = true; break;
+            case 'q': case 'Q': command = "q"; send = true; break;
+            case 'e': case 'E': command = "e"; send = true; break;
+            case 'r': case 'R': command = "r"; send = true; break;
+            case 'f': case 'F': command = "f"; send = true; break;
+            case ' ': command = " "; send = true; break;
+            default: break;
             }
 
-            // === ЗАЩИТА ОТ ДУБЛИРОВАНИЯ ===
-            auto now = std::chrono::steady_clock::now();
-            if (!tcp_command.empty() && tcp_command == last_sent_command) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sent_time);
-                if (elapsed.count() < 300) {
-                    std::cout << "⏭️ Игнорируем дублирующую команду: " << tcp_command;
-                    continue;
-                }
-            }
-            last_sent_command = tcp_command;
-            last_sent_time = now;
-            // ================================
+            if (send) {
+                // Отображаем нажатую клавишу
+                std::cout << COLOR_GREEN << "📤 " << command << COLOR_RESET << std::endl;
 
-            if (send_to_tcp && !tcp_command.empty()) {
-                send_to_clients(tcp_command.c_str(), tcp_command.length());
-            }
+                // Отправляем всем клиентам
+                command += "\n";
+                send_to_clients(command.c_str(), command.length());
 
-            command_count_++;
-            last_activity_time_ = std::chrono::steady_clock::now();
+                command_count_++;
+                last_activity_time_ = std::chrono::steady_clock::now();
+            }
         }
-    }
-
-    std_msgs::msg::String create_string_msg(const std::string& data) {
-        auto msg = std_msgs::msg::String();
-        msg.data = data;
-        return msg;
     }
 
     // ============================================
@@ -537,7 +281,7 @@ private:
     }
 
     // ============================================
-    // TCP-СЕРВЕР: ПРИЁМ КЛИЕНТОВ
+    // ПРИЁМ КЛИЕНТОВ
     // ============================================
     void accept_clients() {
         log_info("🔄 Поток приёма клиентов запущен");
@@ -588,11 +332,11 @@ private:
     }
 
     // ============================================
-    // ЧТЕНИЕ КОМАНД ОТ КЛИЕНТОВ
+    // ЧТЕНИЕ ДАННЫХ ОТ КЛИЕНТОВ (не используется)
     // ============================================
     void read_from_clients() {
         char buffer[1024];
-        log_info("🔄 Поток чтения клиентов запущен");
+        log_info("🔄 Поток чтения клиентов запущен (только для поддержки соединения)");
 
         while (running_ && rclcpp::ok()) {
             std::vector<int> clients_copy;
@@ -606,20 +350,7 @@ private:
                 ssize_t bytes_read = recv(client, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
 
                 if (bytes_read > 0) {
-                    buffer[bytes_read] = '\0';
-                    std::string data(buffer);
-
-                    std::istringstream stream(data);
-                    std::string line;
-
-                    while (std::getline(stream, line)) {
-                        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
-
-                        if (!line.empty()) {
-                            log_info(COLOR_CYAN "📨 ОТ КЛИЕНТА: '" + line + "'" COLOR_RESET);
-                            process_client_command(line);
-                        }
-                    }
+                    // Игнорируем входящие данные (сервер только отправляет)
                 }
                 else if (bytes_read == 0) {
                     log_warn("🔌 Клиент отключился (recv=0). Удаляем.");
@@ -648,129 +379,6 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         log_info("🔄 Поток чтения клиентов остановлен");
-    }
-
-    // ============================================
-    // ОБРАБОТКА КОМАНД ОТ КЛИЕНТОВ
-    // ============================================
-    void process_client_command(const std::string& command) {
-        auto msg = std_msgs::msg::String();
-
-        if (command.find("TELEGA:") == 0) {
-            std::string telega_cmd = command.substr(7);
-            std::map<std::string, std::string> telega_mapping = {
-                {"W", "w"}, {"S", "s"}, {"A", "a"}, {"D", "d"},
-                {"Q", "q"}, {"E", "e"}, {"R", "r"}, {"F", "f"},
-                {"UP", "w"}, {"DOWN", "s"}, {"LEFT", "a"}, {"RIGHT", "d"},
-                {"SPACE", " "}, {"STOP", "stop"},
-                {"auto_on", "auto_on"}, {"auto_off", "auto_off"}   // добавлено
-            };
-
-            auto it = telega_mapping.find(telega_cmd);
-            msg.data = (it != telega_mapping.end()) ? it->second : telega_cmd;
-            telega_cmd_pub_->publish(msg);
-            log_info("🚜 Команда тележке: '" + telega_cmd + "' -> '" + msg.data + "'");
-        }
-        else if (command.find("CAMERA:") == 0) {
-            std::string camera_cmd = command.substr(7);
-            std::map<std::string, std::string> camera_mapping = {
-                {"UP", "UP"}, {"DOWN", "DOWN"}, {"LEFT", "LEFT"}, {"RIGHT", "RIGHT"},
-                {"PLUS", "PLUS"}, {"MINUS", "MINUS"},
-                {"Z", "Z"}, {"X", "X"}, {"C", "C"}, {"STOP", "STOP"},
-                {"ZOOM_IN", "Z"}, {"ZOOM_OUT", "X"}, {"ZOOM_STOP", "C"},
-                {"1", "1"}, {"2", "2"}   // добавлено
-            };
-
-            auto it = camera_mapping.find(camera_cmd);
-            msg.data = (it != camera_mapping.end()) ? it->second : camera_cmd;
-            camera_cmd_pub_->publish(msg);
-            log_info("📷 Команда камере: '" + camera_cmd + "' -> '" + msg.data + "'");
-        }
-        else {
-            std::map<std::string, std::string> direct_mapping = {
-                {"w", "w"}, {"W", "w"}, {"s", "s"}, {"S", "s"},
-                {"a", "a"}, {"A", "a"}, {"d", "d"}, {"D", "d"},
-                {"q", "q"}, {"Q", "q"}, {"e", "e"}, {"E", "e"},
-                {"r", "r"}, {"R", "r"}, {"f", "f"}, {"F", "f"},
-                {" ", " "}, {"SPACE", " "},
-                {"UP", "UP"}, {"DOWN", "DOWN"}, {"LEFT", "LEFT"}, {"RIGHT", "RIGHT"},
-                {"PLUS", "PLUS"}, {"MINUS", "MINUS"},
-                {"Z", "Z"}, {"X", "X"}, {"C", "C"}, {"STOP", "STOP"},
-                {"1", "1"}, {"2", "2"},
-                {"auto_on", "auto_on"}, {"auto_off", "auto_off"}  // добавлено
-            };
-
-            auto it = direct_mapping.find(command);
-            if (it != direct_mapping.end()) {
-                std::string mapped_cmd = it->second;
-
-                if (mapped_cmd == "UP" || mapped_cmd == "DOWN" ||
-                    mapped_cmd == "LEFT" || mapped_cmd == "RIGHT" ||
-                    mapped_cmd == "PLUS" || mapped_cmd == "MINUS" ||
-                    mapped_cmd == "Z" || mapped_cmd == "X" || mapped_cmd == "C" ||
-                    mapped_cmd == "STOP" || mapped_cmd == "1" || mapped_cmd == "2") {
-                    msg.data = mapped_cmd;
-                    camera_cmd_pub_->publish(msg);
-                    log_info("📷 Прямая команда камере: '" + mapped_cmd + "'");
-                } else {
-                    msg.data = mapped_cmd;
-                    telega_cmd_pub_->publish(msg);
-                    log_info("🚜 Прямая команда тележке: '" + mapped_cmd + "'");
-                }
-            } else {
-                msg.data = command;
-                telega_cmd_pub_->publish(msg);
-                log_warn("🔄 Неизвестная команда: '" + command + "' отправлена тележке");
-            }
-        }
-
-        command_count_++;
-        last_activity_time_ = std::chrono::steady_clock::now();
-    }
-
-    // ============================================
-    // КОЛБЭКИ
-    // ============================================
-    void gimbal_callback(const mavros_msgs::msg::GimbalManagerSetPitchyaw::SharedPtr msg) {
-        command_count_++;
-        last_activity_time_ = std::chrono::steady_clock::now();
-
-        auto angle_msg = std_msgs::msg::Float32MultiArray();
-        angle_msg.data.push_back(msg->pitch);
-        angle_msg.data.push_back(msg->yaw);
-        angle_publisher_->publish(angle_msg);
-
-        char buffer[128];
-        int len = snprintf(buffer, sizeof(buffer), "CAMERA:%.2f,%.2f\n", msg->pitch, msg->yaw);
-        send_to_clients(buffer, len);
-    }
-
-    void teleop_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-        if (msg->data.size() < 2) return;
-
-        float linear = msg->data[0];
-        float angular = msg->data[1];
-        command_count_++;
-        last_activity_time_ = std::chrono::steady_clock::now();
-
-        char buffer[128];
-        int len = snprintf(buffer, sizeof(buffer), "TELEOP:%.2f,%.2f\n", linear, angular);
-        send_to_clients(buffer, len);
-    }
-
-    void key_callback(const std_msgs::msg::String::SharedPtr msg) {
-        command_count_++;
-        last_activity_time_ = std::chrono::steady_clock::now();
-        char buffer[256];
-        int len = snprintf(buffer, sizeof(buffer), "KEY:%s\n", msg->data.c_str());
-        send_to_clients(buffer, len);
-    }
-
-    void keyboard_commands_callback(const std_msgs::msg::String::SharedPtr msg) {
-        command_count_++;
-        last_activity_time_ = std::chrono::steady_clock::now();
-        std::string tcp_message = "KEYBOARD:" + msg->data + "\n";
-        send_to_clients(tcp_message.c_str(), tcp_message.length());
     }
 
     // ============================================
@@ -810,13 +418,6 @@ private:
         std::cout << "  👥 Клиентов: " << clients_.size() << " / " << max_clients_ << std::endl;
         std::cout << "  📝 Команд: " << command_count_ << std::endl;
         std::cout << "  ⏱️  Активность: " << dt << " сек назад" << std::endl;
-
-        if (clients_.empty()) {
-            std::cout << "  ⚠️  Нет подключенных клиентов" << std::endl;
-            std::cout << "  💡 Ожидание подключения..." << std::endl;
-        } else {
-            std::cout << "  ✅ Подключены клиенты" << std::endl;
-        }
         std::cout << "========================================\n" << COLOR_RESET << std::endl;
     }
 
@@ -826,30 +427,16 @@ private:
     std::string server_ip_;
     int server_port_;
     int max_clients_;
-    std::string gimbal_topic_, teleop_topic_, key_topic_, keyboard_commands_topic_;
-    std::string camera_cmd_topic_, telega_cmd_topic_;
 
     int server_fd_;
     std::vector<int> clients_;
     std::mutex clients_mutex_;
     std::thread accept_thread_, read_thread_, keyboard_thread_;
     std::atomic<bool> running_;
-    struct termios old_termios_;
-
-    rclcpp::Subscription<mavros_msgs::msg::GimbalManagerSetPitchyaw>::SharedPtr gimbal_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr teleop_sub_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr key_sub_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr keyboard_commands_sub_;
-
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr angle_publisher_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr camera_cmd_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr telega_cmd_pub_;
 
     rclcpp::TimerBase::SharedPtr stats_timer_;
     std::chrono::steady_clock::time_point last_activity_time_;
     int command_count_;
-
-    bool auto_mode_state_;   // <-- НОВОЕ: состояние автономного режима
 };
 
 int main(int argc, char* argv[]) {

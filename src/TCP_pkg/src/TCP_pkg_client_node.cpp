@@ -11,8 +11,6 @@
 #include <errno.h>
 #include <algorithm>
 #include <sstream>
-#include <iomanip>
-#include <map>
 #include <chrono>
 
 class TcpClientNode : public rclcpp::Node {
@@ -28,14 +26,14 @@ public:
         reconnect_delay_ = this->get_parameter("reconnect_delay_sec").as_double();
         max_reconnect_attempts_ = this->get_parameter("max_reconnect_attempts").as_int();
 
-        RCLCPP_INFO(this->get_logger(), "=== TCP-клиент запущен с параметрами ===");
+        RCLCPP_INFO(this->get_logger(), "=== TCP-клиент (VESC) запущен ===");
         RCLCPP_INFO(this->get_logger(), "  server_ip: %s", server_ip_.c_str());
         RCLCPP_INFO(this->get_logger(), "  server_port: %d", server_port_);
         RCLCPP_INFO(this->get_logger(), "  reconnect_delay: %.1f сек", reconnect_delay_);
         RCLCPP_INFO(this->get_logger(), "  max_reconnect_attempts: %d", max_reconnect_attempts_);
 
+        // Публикатор команд для VESC
         telega_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/telega_commands", 10);
-        camera_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/camera_control", 10);
 
         reconnect_thread_ = std::thread(&TcpClientNode::reconnect_loop, this);
     }
@@ -124,13 +122,9 @@ private:
             fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK);
         }
 
-        // Отправляем приветствие серверу
+        // Приветствие (необязательно)
         std::string hello = "HELLO\n";
-        if (send(sockfd_, hello.c_str(), hello.length(), 0) < 0) {
-            RCLCPP_WARN(this->get_logger(), "Не удалось отправить приветствие: %s", strerror(errno));
-        } else {
-            RCLCPP_INFO(this->get_logger(), "Отправлено приветствие серверу");
-        }
+        send(sockfd_, hello.c_str(), hello.length(), 0);
 
         return true;
     }
@@ -163,9 +157,19 @@ private:
                 std::string line;
 
                 while (std::getline(stream, line)) {
+                    // Удаляем \r, если есть
                     line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+
                     if (!line.empty()) {
-                        process_server_message(line);
+                        // Игнорируем "HELLO" если оно пришло
+                        if (line == "HELLO") continue;
+
+                        // Публикуем команду в топик /telega_commands
+                        auto msg = std_msgs::msg::String();
+                        msg.data = line;
+                        telega_cmd_pub_->publish(msg);
+
+                        RCLCPP_INFO(this->get_logger(), "📨 Получена команда: '%s'", line.c_str());
                     }
                 }
             }
@@ -190,62 +194,6 @@ private:
         RCLCPP_INFO(this->get_logger(), "Поток чтения завершён");
     }
 
-    void process_server_message(const std::string& line) {
-        if (line == "HELLO") return;
-
-        auto msg = std_msgs::msg::String();
-
-        if (line.find("KEY:") == 0) {
-            std::string key_info = line.substr(4);
-
-            std::map<std::string, std::string> key_mapping = {
-                {"W:press", "w"}, {"S:press", "s"},
-                {"A:press", "a"}, {"D:press", "d"},
-                {"Q:press", "q"}, {"E:press", "e"},
-                {"R:press", "r"}, {"F:press", "f"},
-                {"SPACE:press", " "},
-                {"UP:press", "UP"}, {"DOWN:press", "DOWN"},
-                {"LEFT:press", "LEFT"}, {"RIGHT:press", "RIGHT"},
-                {"PLUS:press", "PLUS"}, {"MINUS:press", "MINUS"},
-                {"Z:press", "Z"}, {"X:press", "X"}, {"C:press", "C"},
-                {"1:press", "1"}, {"2:press", "2"}
-            };
-
-            auto it = key_mapping.find(key_info);
-            if (it != key_mapping.end()) {
-                std::string command = it->second;
-                msg.data = command;
-
-                if (command == "UP" || command == "DOWN" || command == "LEFT" || command == "RIGHT" ||
-                    command == "PLUS" || command == "MINUS" || command == "Z" || command == "X" || command == "C" ||
-                    command == "1" || command == "2") {
-                    camera_cmd_pub_->publish(msg);
-                    RCLCPP_INFO(this->get_logger(), "📷 Команда камере: '%s'", command.c_str());
-                } else {
-                    telega_cmd_pub_->publish(msg);
-                    RCLCPP_INFO(this->get_logger(), "🚜 Команда тележке: '%s'", command.c_str());
-                }
-            } else {
-                RCLCPP_DEBUG(this->get_logger(), "Неизвестная клавиша: %s", key_info.c_str());
-            }
-        }
-        else if (line.find("TELEGA:") == 0) {
-            std::string cmd = line.substr(7);
-            msg.data = cmd;
-            telega_cmd_pub_->publish(msg);
-            RCLCPP_INFO(this->get_logger(), "🚜 TCP TELEGA: '%s'", cmd.c_str());
-        }
-        else if (line.find("CAMERA:") == 0) {
-            std::string cmd = line.substr(7);
-            msg.data = cmd;
-            camera_cmd_pub_->publish(msg);
-            RCLCPP_INFO(this->get_logger(), "📷 TCP CAMERA: '%s'", cmd.c_str());
-        }
-        else {
-            RCLCPP_DEBUG(this->get_logger(), "Неизвестная команда: %s", line.c_str());
-        }
-    }
-
     std::string server_ip_;
     int server_port_;
     double reconnect_delay_;
@@ -257,7 +205,6 @@ private:
     std::thread read_thread_;
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr telega_cmd_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr camera_cmd_pub_;
 };
 
 int main(int argc, char* argv[]) {
