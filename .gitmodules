@@ -1,2 +1,6 @@
 [submodule "src/vesc"]
+	path = src/vesc
 	url = git@github.com:fr1cadelka/vesc.git
+[submodule "src/transport_drivers"]
+	path = src/transport_drivers
+	url = git@github.com:fr1cadelka/transport_drivers.git
