@@ -31,11 +31,9 @@ public:
         max_speed_ = 15000.0;
         turn_factor_ = 0.6;
 
-        // ===== Круиз-контроль =====
         cruise_active_ = false;
         cruise_speed_ = 3000.0;
 
-        // Публикуем в топики СКОРОСТИ (RPM)
         left_pub_  = this->create_publisher<std_msgs::msg::Float64>("/left/commands/motor/speed", 10);
         right_pub_ = this->create_publisher<std_msgs::msg::Float64>("/right/commands/motor/speed", 10);
 
@@ -48,6 +46,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "==============================================");
         RCLCPP_INFO(this->get_logger(), "  VESC Teleop — 2 мотора (left / right)");
         RCLCPP_INFO(this->get_logger(), "  РЕЖИМ: Скорость (RPM)");
+        RCLCPP_INFO(this->get_logger(), "  Топик команд: /telega_commands");
         RCLCPP_INFO(this->get_logger(), "==============================================");
         printHelp();
         printStatus();
@@ -74,7 +73,7 @@ public:
                 continue;
             }
 
-            // ===== Круиз-контроль на Q =====
+            // Круиз-контроль
             if (ch == 'q' || ch == 'Q') {
                 if (is_armed_) {
                     cruise_active_ = !cruise_active_;
@@ -116,13 +115,13 @@ public:
                 last_linear_time_ = this->now();
             }
             // Влево (A)
-            else if (ch == 'd' || ch == 'D') {
-                angular_cmd_ = -speed_step_ * turn_factor_;
+            else if (ch == 'a' || ch == 'A') {
+                angular_cmd_ = speed_step_ * turn_factor_;
                 last_angular_time_ = this->now();
             }
             // Вправо (D)
-            else if (ch == 'a' || ch == 'A') {
-                angular_cmd_ = speed_step_ * turn_factor_;
+            else if (ch == 'd' || ch == 'D') {
+                angular_cmd_ = -speed_step_ * turn_factor_;
                 last_angular_time_ = this->now();
             }
             // Аварийный стоп
@@ -141,20 +140,72 @@ public:
 private:
     void cmdCallback(const std_msgs::msg::String::SharedPtr msg) {
         std::string cmd = msg->data;
+        RCLCPP_INFO(this->get_logger(), "📥 Получена команда: '%s'", cmd.c_str());
 
+        // === ARM/DISARM через 'e' ===
+        if (cmd == "e" || cmd == "E") {
+            is_armed_ = !is_armed_;
+            if (is_armed_) {
+                RCLCPP_WARN(this->get_logger(), "ARMED (TCP)");
+            } else {
+                linear_cmd_ = 0.0;
+                angular_cmd_ = 0.0;
+                cruise_active_ = false;
+                RCLCPP_WARN(this->get_logger(), "DISARMED (TCP)");
+            }
+            printStatus();
+            return;
+        }
+
+        // Альтернативные команды ARM/DISARM (для совместимости)
         if (cmd == "arm" || cmd == "ARM") {
             is_armed_ = true;
-            RCLCPP_WARN(this->get_logger(), "TCP: ARMED");
+            RCLCPP_WARN(this->get_logger(), "ARMED (arm)");
+            printStatus();
+            return;
         }
         else if (cmd == "disarm" || cmd == "DISARM" || cmd == "stop" || cmd == "STOP") {
             is_armed_ = false;
             linear_cmd_ = 0.0;
             angular_cmd_ = 0.0;
             cruise_active_ = false;
-            RCLCPP_WARN(this->get_logger(), "TCP: DISARMED");
+            RCLCPP_WARN(this->get_logger(), "DISARMED (disarm/stop)");
+            printStatus();
+            return;
         }
-        else if (!is_armed_) return;
-        else if (cmd == "w" || cmd == "W") {
+
+        if (!is_armed_) return;
+
+        // === Круиз-контроль через 'q' ===
+        if (cmd == "q" || cmd == "Q") {
+            cruise_active_ = !cruise_active_;
+            if (cruise_active_) {
+                linear_cmd_ = 0.0;
+                angular_cmd_ = 0.0;
+                RCLCPP_WARN(this->get_logger(), "CRUISE ON (TCP)");
+            } else {
+                linear_cmd_ = 0.0;
+                angular_cmd_ = 0.0;
+                RCLCPP_WARN(this->get_logger(), "CRUISE OFF (TCP)");
+            }
+            printStatus();
+            return;
+        }
+
+        // === Регулировка скорости через 'r' и 'f' ===
+        if (cmd == "r" || cmd == "R") {
+            speed_step_ = std::min(speed_step_ + 100.0, max_speed_);
+            printStatus();
+            return;
+        }
+        else if (cmd == "f" || cmd == "F") {
+            speed_step_ = std::max(100.0, speed_step_ - 100.0);
+            printStatus();
+            return;
+        }
+
+        // === Движение ===
+        if (cmd == "w" || cmd == "W") {
             linear_cmd_ = speed_step_;
             last_linear_time_ = this->now();
         }
@@ -162,12 +213,12 @@ private:
             linear_cmd_ = -speed_step_;
             last_linear_time_ = this->now();
         }
-        else if (cmd == "d" || cmd == "D") {
-            angular_cmd_ = -speed_step_ * turn_factor_;
+        else if (cmd == "a" || cmd == "A") {      // Влево
+            angular_cmd_ = speed_step_ * turn_factor_;
             last_angular_time_ = this->now();
         }
-        else if (cmd == "a" || cmd == "A") {
-            angular_cmd_ = speed_step_ * turn_factor_;
+        else if (cmd == "d" || cmd == "D") {      // Вправо
+            angular_cmd_ = -speed_step_ * turn_factor_;
             last_angular_time_ = this->now();
         }
         else if (cmd == " " || cmd == "space") {
@@ -175,24 +226,19 @@ private:
             angular_cmd_ = 0.0;
             is_armed_ = false;
             cruise_active_ = false;
-        }
-        else if (cmd == "cruise_on" || cmd == "CRUISE_ON") {
-            if (is_armed_) cruise_active_ = true;
-        }
-        else if (cmd == "cruise_off" || cmd == "CRUISE_OFF") {
-            cruise_active_ = false;
+            RCLCPP_WARN(this->get_logger(), "EMERGENCY STOP (TCP)");
+            printStatus();
         }
     }
 
     void controlLoop() {
         auto now = this->now();
 
-        // ===== Круиз-контроль =====
+        // Круиз-контроль
         if (cruise_active_ && is_armed_) {
             linear_cmd_ = cruise_speed_;
             angular_cmd_ = 0.0;
         } else {
-            // Таймаут отпускания клавиш (0.2 сек)
             if ((now - last_linear_time_).seconds() > 0.20) {
                 linear_cmd_ = 0.0;
             }
@@ -205,23 +251,19 @@ private:
         double right = 0.0;
 
         if (is_armed_) {
-            // ===== ЗЕРКАЛЬНАЯ ЛОГИКА =====
-            // Если едем прямо (или круиз), моторы вращаются в РАЗНЫЕ стороны.
+            // Зеркальная логика
             if (angular_cmd_ == 0.0) {
                 left  = -linear_cmd_;
                 right =  linear_cmd_;
-            }
-            // Если поворачиваем, моторы вращаются в ОДНУ сторону.
-            else {
+            } else {
                 left  = -linear_cmd_ - angular_cmd_;
-                right = linear_cmd_ - angular_cmd_;
+                right =  linear_cmd_ - angular_cmd_;
             }
 
             left  = std::clamp(left,  -max_speed_, max_speed_);
             right = std::clamp(right, -max_speed_, max_speed_);
         }
 
-        // Публикуем команды
         std_msgs::msg::Float64 msg_l, msg_r;
         msg_l.data = left;
         msg_r.data = right;
@@ -229,7 +271,6 @@ private:
         left_pub_->publish(msg_l);
         right_pub_->publish(msg_r);
 
-        // Лог раз в секунду
         static int cnt = 0;
         if (++cnt >= 20) {
             cnt = 0;
@@ -278,7 +319,6 @@ private:
     double max_speed_;
     double turn_factor_;
 
-    // ===== Круиз-контроль =====
     bool cruise_active_;
     double cruise_speed_;
 
