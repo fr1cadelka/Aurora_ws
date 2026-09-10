@@ -9,7 +9,9 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-find_package(vesc_msgs REQUIRED)  # <-- Добавлено!
+find_package(vesc_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)   # <-- ОБЯЗАТЕЛЬНО
+find_package(std_msgs REQUIRED)
 
 add_executable(odometry_pkg_node src/odometry_pkg_node.cpp)
 
@@ -21,7 +23,8 @@ target_include_directories(odometry_pkg_node PUBLIC
   ${std_srvs_INCLUDE_DIRS}
   ${tf2_INCLUDE_DIRS}
   ${tf2_geometry_msgs_INCLUDE_DIRS}
-  ${vesc_msgs_INCLUDE_DIRS}  # <-- Добавлено!
+  ${vesc_msgs_INCLUDE_DIRS}
+  ${sensor_msgs_INCLUDE_DIRS}   # <-- ДОБАВИТЬ
 )
 
 target_link_libraries(odometry_pkg_node
@@ -32,7 +35,9 @@ target_link_libraries(odometry_pkg_node
   ${std_srvs_LIBRARIES}
   ${tf2_LIBRARIES}
   ${tf2_geometry_msgs_LIBRARIES}
-  ${vesc_msgs_LIBRARIES}  # <-- Добавлено!
+  ${vesc_msgs_LIBRARIES}
+  ${sensor_msgs_LIBRARIES}   # <-- ДОБАВИТЬ
+  ${std_msgs_LIBRARIES}
 )
 
 install(TARGETS odometry_pkg_node

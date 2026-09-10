@@ -1,26 +1,34 @@
 cmake_minimum_required(VERSION 3.8)
 project(launch_rover)
 
+# Устанавливаем стандарт C++ (для совместимости)
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+endif()
+
+# Отключаем предупреждения, если они не нужны (оставляем как есть)
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
+# Поиск необходимых зависимостей (для launch-пакета нужен только ament_cmake)
 find_package(ament_cmake REQUIRED)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
 
+# --- Тесты (опционально) ---
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
+  # Пропускаем проверку copyright и cpplint, так как у нас нет исходников
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+# --- Установка launch-файлов и конфигурации RViz ---
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+
+# --- Сборка пакета ---
 ament_package()

@@ -14,6 +14,7 @@ find_package(OpenCV REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(mavros_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # ===== Старый узел (Pixhawk / MAVROS) =====
 add_executable(control_telega_pkg_node src/control_telega_pkg_node.cpp)
@@ -24,6 +25,7 @@ ament_target_dependencies(control_telega_pkg_node
   OpenCV
   geometry_msgs
   mavros_msgs
+  std_msgs
 )
 
 # ===== Новый узел (прямое управление VESC) =====
@@ -35,6 +37,7 @@ ament_target_dependencies(control_vesk_pkg_node
     OpenCV
     geometry_msgs
     mavros_msgs
+    std_msgs
 )
 
 # ===== Установка =====
