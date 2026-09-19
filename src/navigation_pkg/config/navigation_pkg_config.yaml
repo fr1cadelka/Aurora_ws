@@ -1,0 +1,14 @@
+area_selector:
+  ros__parameters:
+    frame_id: map
+    odom_topic: /odom
+
+    # Прямоугольная область 20 x 20 м
+    area_width: 20.0
+    area_height: 20.0
+    area_origin_x: 0.0     # левый нижний угол области
+    area_origin_y: 0.0
+
+    # Траектория
+    traj_min_dist: 0.05    # 5 см — минимальный шаг
+    traj_max_points: 10000 # лимит буфера (после — вытесняем старые)
