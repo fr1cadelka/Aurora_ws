@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/empty.hpp>
 #include <termios.h>
 #include <unistd.h>
 #include <iostream>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 using namespace std::chrono_literals;
@@ -41,6 +43,9 @@ public:
         this->declare_parameter<double>("min_erpm", 300.0);       // мёртвая зона
         this->declare_parameter<double>("erpm_slew_rate", 4000.0); // ERPM/с — плавность
 
+        // === НОВЫЙ параметр автонома ===
+        this->declare_parameter<double>("auto_speed_erpm", 2000.0);
+
         this->get_parameter("correction_scale", correction_scale_);
         this->get_parameter("invert_correction", invert_correction_);
         this->get_parameter("invert_left", invert_left_);
@@ -50,11 +55,13 @@ public:
         this->get_parameter("erpm_step", erpm_step_);
         this->get_parameter("min_erpm", min_erpm_);
         this->get_parameter("erpm_slew_rate", erpm_slew_rate_);
+        this->get_parameter("auto_speed_erpm", auto_speed_erpm_);
 
         RCLCPP_INFO(this->get_logger(), "max_erpm         = %.0f", max_erpm_);
         RCLCPP_INFO(this->get_logger(), "erpm_step        = %.0f", erpm_step_);
         RCLCPP_INFO(this->get_logger(), "min_erpm         = %.0f", min_erpm_);
         RCLCPP_INFO(this->get_logger(), "erpm_slew_rate   = %.0f ERPM/s", erpm_slew_rate_);
+        RCLCPP_INFO(this->get_logger(), "auto_speed_erpm  = %.0f", auto_speed_erpm_);
 
         is_armed_     = false;
         linear_cmd_   = 0.0;
@@ -84,6 +91,12 @@ public:
         correction_sub_ = this->create_subscription<std_msgs::msg::Float64>(
             "/correction", 10,
             [this](const std_msgs::msg::Float64::SharedPtr msg) { correction_ = msg->data; });
+
+        // === НОВОЕ: клиенты сервисов одометрии ===
+        set_target_client_ = this->create_client<std_srvs::srv::Empty>(
+            "/odometry_pkg_node/set_target_heading");
+        clear_target_client_ = this->create_client<std_srvs::srv::Empty>(
+            "/odometry_pkg_node/clear_target_heading");
 
         timer_ = this->create_wall_timer(20ms, std::bind(&VescTeleopNode::controlLoop, this));
 
@@ -119,10 +132,36 @@ private:
         if (!is_armed_) { std::cout << "\n[!] Сначала ARM (E)\n"; return; }
 
         if (ch == 'm' || ch == 'M') {
-            auto_mode_ = !auto_mode_;
-            linear_cmd_ = auto_mode_ ? speed_step_ : 0.0;
-            angular_cmd_ = 0.0;
-            RCLCPP_WARN(this->get_logger(), auto_mode_ ? "AUTO MODE ON" : "AUTO MODE OFF");
+            if (!auto_mode_) {
+                // === ВХОД В АВТОНОМ: фиксируем эталон курса ===
+                if (!set_target_client_->service_is_ready()) {
+                    RCLCPP_ERROR(this->get_logger(),
+                                 "AUTO: сервис /odometry_pkg_node/set_target_heading недоступен!");
+                    return;
+                }
+                auto req = std::make_shared<std_srvs::srv::Empty::Request>();
+                set_target_client_->async_send_request(req);
+
+                auto_mode_   = true;
+                linear_cmd_  = auto_speed_erpm_;
+                angular_cmd_ = 0.0;
+                RCLCPP_WARN(this->get_logger(),
+                            "AUTO MODE ON @ %.0f ERPM (heading locked)", auto_speed_erpm_);
+            } else {
+                // === ВЫХОД ИЗ АВТОНОМА ===
+                if (clear_target_client_->service_is_ready()) {
+                    auto req = std::make_shared<std_srvs::srv::Empty::Request>();
+                    clear_target_client_->async_send_request(req);
+                } else {
+                    RCLCPP_WARN(this->get_logger(),
+                                "AUTO: сервис clear_target_heading недоступен, сбрасываем локально");
+                }
+                auto_mode_   = false;
+                linear_cmd_  = 0.0;
+                angular_cmd_ = 0.0;
+                correction_  = 0.0;
+                RCLCPP_WARN(this->get_logger(), "AUTO MODE OFF");
+            }
             printStatus();
             return;
         }
@@ -217,6 +256,11 @@ private:
     }
 
     void emergencyStop() {
+        // Если были в автономе — снимаем эталон курса
+        if (auto_mode_ && clear_target_client_->service_is_ready()) {
+            auto req = std::make_shared<std_srvs::srv::Empty::Request>();
+            clear_target_client_->async_send_request(req);
+        }
         resetMotion();
         is_armed_ = false;
         smooth_left_ = smooth_right_ = 0.0;
@@ -237,6 +281,10 @@ private:
             printStatus(); return;
         }
         if (cmd == "disarm" || cmd == "DISARM" || cmd == "stop" || cmd == "STOP") {
+            if (auto_mode_ && clear_target_client_->service_is_ready()) {
+                auto req = std::make_shared<std_srvs::srv::Empty::Request>();
+                clear_target_client_->async_send_request(req);
+            }
             resetMotion(); is_armed_ = false;
             publishMotors(0.0, 0.0);
             RCLCPP_WARN(this->get_logger(), "DISARMED (TCP)");
@@ -323,6 +371,11 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr correction_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::mutex mtx_;
+
+    // === НОВЫЕ поля ===
+    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr set_target_client_;
+    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_target_client_;
+    double auto_speed_erpm_;
 
     bool   is_armed_;
     double linear_cmd_, angular_cmd_;
