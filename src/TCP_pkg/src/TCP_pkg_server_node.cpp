@@ -102,7 +102,7 @@ public:
         log_info("========================================");
 
         // Параметры
-        this->declare_parameter("server_ip", "127.0.0.1");
+        this->declare_parameter("server_ip", "192.168.68.98");
         this->declare_parameter("server_port", 6000);
         this->declare_parameter("max_clients", 10);
 
