@@ -4,3 +4,6 @@
 [submodule "src/transport_drivers"]
 	path = src/transport_drivers
 	url = git@github.com:fr1cadelka/transport_drivers.git
+[submodule "src/nlink_parser2"]
+	path = src/nlink_parser2
+	url = git@github.com:fr1cadelka/nlink_parser2.git
