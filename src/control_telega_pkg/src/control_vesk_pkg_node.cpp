@@ -1,7 +1,11 @@
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
-#include <std_srvs/srv/empty.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <termios.h>
 #include <unistd.h>
 #include <iostream>
@@ -14,6 +18,13 @@
 #include <mutex>
 
 using namespace std::chrono_literals;
+
+static double normalize_angle(double a)
+{
+    while (a >  M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
+}
 
 int getch() {
     static struct termios oldt, newt;
@@ -29,81 +40,88 @@ int getch() {
 class VescTeleopNode : public rclcpp::Node {
 public:
     VescTeleopNode() : Node("control_vesk_pkg_node") {
-        // === Параметры (всё в узле, VESC Tool не трогаем) ===
-        this->declare_parameter<double>("correction_scale", 500.0);
-        this->declare_parameter<bool>("invert_correction", false);
-        this->declare_parameter<bool>("invert_left", false);
-        this->declare_parameter<bool>("invert_right", false);
-        this->declare_parameter<bool>("invert_angular", false);
+        // ===== Параметры (не тронуты) =====
+        declare_parameter<double>("correction_scale", 500.0);
+        declare_parameter<bool>  ("invert_correction", false);
+        declare_parameter<bool>  ("invert_left", false);
+        declare_parameter<bool>  ("invert_right", false);
+        declare_parameter<bool>  ("invert_angular", false);
+        declare_parameter<double>("max_erpm", 30000.0);
+        declare_parameter<double>("erpm_step", 250.0);
+        declare_parameter<double>("min_erpm", 300.0);
+        declare_parameter<double>("erpm_slew_rate", 4000.0);
 
-        // ERPM — единицы скорости вращения, которые понимает VESC в режиме PID Speed.
-        // 100000 ERPM — это порядка 10000-15000 RPM на 14-полюсном моторе.
-        this->declare_parameter<double>("max_erpm", 30000.0);
-        this->declare_parameter<double>("erpm_step", 250.0);
-        this->declare_parameter<double>("min_erpm", 300.0);       // мёртвая зона
-        this->declare_parameter<double>("erpm_slew_rate", 4000.0); // ERPM/с — плавность
+        // ===== НОВЫЕ параметры автонома =====
+        declare_parameter<double>("auto_speed_erpm",    1750.0);  // ≈ 1750 ERPM
+        declare_parameter<double>("auto_lookahead_m",   1.5);
+        declare_parameter<double>("auto_kp_heading",    1.2);
+        declare_parameter<double>("auto_max_w_erpm",    5000.0);
+        declare_parameter<double>("auto_uwb_timeout_s", 2.0);     // отвал UWB
+        declare_parameter<double>("auto_odom_timeout_s",1.0);
+        declare_parameter<double>("auto_goal_tol_m",    0.5);     // достигли конца траектории
 
-        // === НОВЫЙ параметр автонома ===
-        this->declare_parameter<double>("auto_speed_erpm", 2000.0);
+        get_parameter("correction_scale", correction_scale_);
+        get_parameter("invert_correction", invert_correction_);
+        get_parameter("invert_left", invert_left_);
+        get_parameter("invert_right", invert_right_);
+        get_parameter("invert_angular", invert_angular_);
+        get_parameter("max_erpm", max_erpm_);
+        get_parameter("erpm_step", erpm_step_);
+        get_parameter("min_erpm", min_erpm_);
+        get_parameter("erpm_slew_rate", erpm_slew_rate_);
+        get_parameter("auto_speed_erpm", auto_speed_erpm_);
+        get_parameter("auto_lookahead_m", auto_lookahead_m_);
+        get_parameter("auto_kp_heading", auto_kp_heading_);
+        get_parameter("auto_max_w_erpm", auto_max_w_erpm_);
+        get_parameter("auto_uwb_timeout_s", auto_uwb_timeout_s_);
+        get_parameter("auto_odom_timeout_s", auto_odom_timeout_s_);
+        get_parameter("auto_goal_tol_m", auto_goal_tol_m_);
 
-        this->get_parameter("correction_scale", correction_scale_);
-        this->get_parameter("invert_correction", invert_correction_);
-        this->get_parameter("invert_left", invert_left_);
-        this->get_parameter("invert_right", invert_right_);
-        this->get_parameter("invert_angular", invert_angular_);
-        this->get_parameter("max_erpm", max_erpm_);
-        this->get_parameter("erpm_step", erpm_step_);
-        this->get_parameter("min_erpm", min_erpm_);
-        this->get_parameter("erpm_slew_rate", erpm_slew_rate_);
-        this->get_parameter("auto_speed_erpm", auto_speed_erpm_);
+        RCLCPP_INFO(get_logger(), "=== VESC Teleop ===");
+        RCLCPP_INFO(get_logger(), "max_erpm       = %.0f", max_erpm_);
+        RCLCPP_INFO(get_logger(), "auto_speed     = %.0f ERPM", auto_speed_erpm_);
+        RCLCPP_INFO(get_logger(), "auto_lookahead = %.2f m", auto_lookahead_m_);
+        RCLCPP_INFO(get_logger(), "auto_kp        = %.2f", auto_kp_heading_);
 
-        RCLCPP_INFO(this->get_logger(), "max_erpm         = %.0f", max_erpm_);
-        RCLCPP_INFO(this->get_logger(), "erpm_step        = %.0f", erpm_step_);
-        RCLCPP_INFO(this->get_logger(), "min_erpm         = %.0f", min_erpm_);
-        RCLCPP_INFO(this->get_logger(), "erpm_slew_rate   = %.0f ERPM/s", erpm_slew_rate_);
-        RCLCPP_INFO(this->get_logger(), "auto_speed_erpm  = %.0f", auto_speed_erpm_);
-
+        // ===== Состояние =====
         is_armed_     = false;
         linear_cmd_   = 0.0;
         angular_cmd_  = 0.0;
-        speed_step_   = 3000.0;    // стартовая скорость, ERPM
+        speed_step_   = 3000.0;
         turn_factor_  = 0.6;
-
         cruise_active_ = false;
         cruise_speed_  = 0.0;
-
-        auto_mode_  = false;
-        correction_ = 0.0;
-
+        auto_mode_    = false;
         smooth_left_  = 0.0;
         smooth_right_ = 0.0;
 
-        // ВАЖНО: режим скорости
-        left_pub_  = this->create_publisher<std_msgs::msg::Float64>("/left/commands/motor/speed", 10);
-        right_pub_ = this->create_publisher<std_msgs::msg::Float64>("/right/commands/motor/speed", 10);
-
+        // ===== Publishers =====
+        left_pub_  = create_publisher<std_msgs::msg::Float64>("/left/commands/motor/speed", 10);
+        right_pub_ = create_publisher<std_msgs::msg::Float64>("/right/commands/motor/speed", 10);
         publishMotors(0.0, 0.0);
 
-        cmd_sub_ = this->create_subscription<std_msgs::msg::String>(
+        // ===== Subscribers =====
+        cmd_sub_ = create_subscription<std_msgs::msg::String>(
             "/telega_commands", 10,
             std::bind(&VescTeleopNode::cmdCallback, this, std::placeholders::_1));
 
-        correction_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "/correction", 10,
-            [this](const std_msgs::msg::Float64::SharedPtr msg) { correction_ = msg->data; });
+        uwb_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/uwb/pose", rclcpp::QoS(10),
+            std::bind(&VescTeleopNode::uwb_pose_callback, this, std::placeholders::_1));
 
-        // === НОВОЕ: клиенты сервисов одометрии ===
-        set_target_client_ = this->create_client<std_srvs::srv::Empty>(
-            "/odometry_pkg_node/set_target_heading");
-        clear_target_client_ = this->create_client<std_srvs::srv::Empty>(
-            "/odometry_pkg_node/clear_target_heading");
+        trajectory_sub_ = create_subscription<nav_msgs::msg::Path>(
+            "/uwb/trajectory", rclcpp::QoS(10),
+            std::bind(&VescTeleopNode::trajectory_callback, this, std::placeholders::_1));
 
-        timer_ = this->create_wall_timer(20ms, std::bind(&VescTeleopNode::controlLoop, this));
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            "/odom", rclcpp::QoS(10),
+            std::bind(&VescTeleopNode::odom_callback, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(), "==============================================");
-        RCLCPP_INFO(this->get_logger(), "  VESC Teleop — 2 мотора, режим СКОРОСТИ (ERPM)");
-        RCLCPP_INFO(this->get_logger(), "  Топики: /left|right/commands/motor/speed");
-        RCLCPP_INFO(this->get_logger(), "==============================================");
+        // ===== Таймер 50 Гц =====
+        timer_ = create_wall_timer(20ms, std::bind(&VescTeleopNode::controlLoop, this));
+
+        RCLCPP_INFO(get_logger(), "Subscribed: VESC core, /telega_commands, /uwb/pose, /uwb/trajectory, /odom");
+        RCLCPP_INFO(get_logger(), "Publishing: /left|right/commands/motor/speed");
         printHelp();
         printStatus();
     }
@@ -116,14 +134,47 @@ public:
     }
 
 private:
-    // ================= КЛАВИШИ =================
+    // ============================================================
+    // CALLBACKS
+    // ============================================================
+    void uwb_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        uwb_x_ = msg->pose.position.x;
+        uwb_y_ = msg->pose.position.y;
+        tf2::Quaternion q(
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z,
+            msg->pose.orientation.w);
+        double r, p, y;
+        tf2::Matrix3x3(q).getRPY(r, p, y);
+        uwb_yaw_ = y;
+        uwb_pose_time_ = this->now();
+        uwb_pose_received_ = true;
+    }
+
+    void trajectory_callback(const nav_msgs::msg::Path::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        trajectory_ = *msg;
+    }
+
+    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        odom_time_ = this->now();
+        odom_received_ = true;
+        odom_v_ = msg->twist.twist.linear.x;
+    }
+
+    // ============================================================
+    // KEYBOARD HANDLER
+    // ============================================================
     void handleKey(int ch) {
         std::lock_guard<std::mutex> lk(mtx_);
 
         if (ch == 'e' || ch == 'E') {
             is_armed_ = !is_armed_;
-            if (is_armed_) RCLCPP_WARN(this->get_logger(), "ARMED");
-            else { resetMotion(); RCLCPP_WARN(this->get_logger(), "DISARMED"); }
+            if (is_armed_) RCLCPP_WARN(get_logger(), "ARMED");
+            else { resetMotion(); RCLCPP_WARN(get_logger(), "DISARMED"); }
             printStatus();
             return;
         }
@@ -131,36 +182,23 @@ private:
 
         if (!is_armed_) { std::cout << "\n[!] Сначала ARM (E)\n"; return; }
 
+        // ===== АВТОНОМ =====
         if (ch == 'm' || ch == 'M') {
             if (!auto_mode_) {
-                // === ВХОД В АВТОНОМ: фиксируем эталон курса ===
-                if (!set_target_client_->service_is_ready()) {
-                    RCLCPP_ERROR(this->get_logger(),
-                                 "AUTO: сервис /odometry_pkg_node/set_target_heading недоступен!");
-                    return;
+                if (!check_auto_ready()) {
+                    return;   // причина уже в логе
                 }
-                auto req = std::make_shared<std_srvs::srv::Empty::Request>();
-                set_target_client_->async_send_request(req);
-
-                auto_mode_   = true;
-                linear_cmd_  = auto_speed_erpm_;
+                auto_mode_ = true;
+                linear_cmd_ = auto_speed_erpm_;
                 angular_cmd_ = 0.0;
-                RCLCPP_WARN(this->get_logger(),
-                            "AUTO MODE ON @ %.0f ERPM (heading locked)", auto_speed_erpm_);
+                RCLCPP_WARN(get_logger(),
+                            "AUTO MODE ON @ %.0f ERPM | traj: %zu pts | lookahead: %.2f m",
+                            auto_speed_erpm_, trajectory_.poses.size(), auto_lookahead_m_);
             } else {
-                // === ВЫХОД ИЗ АВТОНОМА ===
-                if (clear_target_client_->service_is_ready()) {
-                    auto req = std::make_shared<std_srvs::srv::Empty::Request>();
-                    clear_target_client_->async_send_request(req);
-                } else {
-                    RCLCPP_WARN(this->get_logger(),
-                                "AUTO: сервис clear_target_heading недоступен, сбрасываем локально");
-                }
-                auto_mode_   = false;
-                linear_cmd_  = 0.0;
+                auto_mode_ = false;
+                linear_cmd_ = 0.0;
                 angular_cmd_ = 0.0;
-                correction_  = 0.0;
-                RCLCPP_WARN(this->get_logger(), "AUTO MODE OFF");
+                RCLCPP_WARN(get_logger(), "AUTO MODE OFF");
             }
             printStatus();
             return;
@@ -170,20 +208,19 @@ private:
             if (auto_mode_) { std::cout << "\n[!] Круиз недоступен в авто\n"; return; }
             cruise_active_ = !cruise_active_;
             if (cruise_active_) {
-                cruise_speed_ = speed_step_;       // базовая скорость = текущая
-                linear_cmd_   = cruise_speed_;
-                angular_cmd_  = 0.0;
-                RCLCPP_WARN(this->get_logger(), "CRUISE ON @ %.0f ERPM", cruise_speed_);
-            } else {
-                linear_cmd_  = 0.0;
+                cruise_speed_ = speed_step_;
+                linear_cmd_ = cruise_speed_;
                 angular_cmd_ = 0.0;
-                RCLCPP_WARN(this->get_logger(), "CRUISE OFF");
+                RCLCPP_WARN(get_logger(), "CRUISE ON @ %.0f ERPM", cruise_speed_);
+            } else {
+                linear_cmd_ = 0.0;
+                angular_cmd_ = 0.0;
+                RCLCPP_WARN(get_logger(), "CRUISE OFF");
             }
             printStatus();
             return;
         }
 
-        // Скорость — работает и в ручном, и в круизе
         if (ch == 'r' || ch == 'R') {
             speed_step_ = std::min(speed_step_ + erpm_step_, max_erpm_);
             if (cruise_active_) linear_cmd_ = speed_step_;
@@ -197,7 +234,6 @@ private:
             return;
         }
 
-        // Острота поворота
         if (ch == ',' || ch == '<') {
             turn_factor_ = std::max(0.05, turn_factor_ - 0.05);
             std::cout << "\n[TURN] factor = " << turn_factor_ << "\n";
@@ -211,7 +247,6 @@ private:
 
         if (auto_mode_) { std::cout << "\n[!] Ручные команды в AUTO заблокированы\n"; return; }
 
-        // Залипающие команды движения
         if (ch == 'w' || ch == 'W') {
             linear_cmd_ = (linear_cmd_ > 0.0) ? 0.0 : speed_step_;
             printStatus(); return;
@@ -230,13 +265,164 @@ private:
         }
     }
 
+    // ============================================================
+    // ПРОВЕРКА ГОТОВНОСТИ ДАННЫХ ПРИ ВХОДЕ В АВТОНОМ
+    // ============================================================
+    bool check_auto_ready() {
+        rclcpp::Time now = this->now();
+        bool ok = true;
+
+        if (!uwb_pose_received_) {
+            RCLCPP_ERROR(get_logger(), "[AUTO] /uwb/pose никогда не приходил");
+            ok = false;
+        } else {
+            double age = (now - uwb_pose_time_).seconds();
+            if (age > 1.0) {
+                RCLCPP_ERROR(get_logger(), "[AUTO] /uwb/pose устарел (%.1f s)", age);
+                ok = false;
+            }
+        }
+
+        if (!odom_received_) {
+            RCLCPP_ERROR(get_logger(), "[AUTO] /odom никогда не приходил");
+            ok = false;
+        } else {
+            double age = (now - odom_time_).seconds();
+            if (age > auto_odom_timeout_s_) {
+                RCLCPP_ERROR(get_logger(), "[AUTO] /odom устарел (%.1f s)", age);
+                ok = false;
+            }
+        }
+
+        if (trajectory_.poses.size() < 2) {
+            RCLCPP_ERROR(get_logger(), "[AUTO] /uwb/trajectory пустая (%zu точек)",
+                         trajectory_.poses.size());
+            ok = false;
+        }
+
+        if (!ok) {
+            RCLCPP_ERROR(get_logger(), "[AUTO] НЕ ВХОДИМ В АВТОНОМ");
+        }
+        return ok;
+    }
+
+    // ============================================================
+    // PURE PURSUIT — вычисление (v, w) для автонома
+    // ============================================================
+    std::pair<double, double> compute_auto_control() {
+        // Копируем всё, что нужно, под мьютексом
+        double cur_x, cur_y, cur_yaw;
+        rclcpp::Time uwb_t, odom_t;
+        nav_msgs::msg::Path traj;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            cur_x = uwb_x_;
+            cur_y = uwb_y_;
+            cur_yaw = uwb_yaw_;
+            uwb_t = uwb_pose_time_;
+            odom_t = odom_time_;
+            traj = trajectory_;
+        }
+
+        rclcpp::Time now = this->now();
+
+        // === Проверка отвала UWB ===
+        if ((now - uwb_t).seconds() > auto_uwb_timeout_s_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[AUTO] UWB timeout %.1f s — STOPPING", (now - uwb_t).seconds());
+            return {0.0, 0.0};
+        }
+        // === Проверка отвала одометрии (нужна для yaw fusion) ===
+        if ((now - odom_t).seconds() > auto_odom_timeout_s_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[AUTO] odom timeout %.1f s — STOPPING", (now - odom_t).seconds());
+            return {0.0, 0.0};
+        }
+
+        if (traj.poses.size() < 2) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "[AUTO] trajectory empty — STOPPING");
+            return {0.0, 0.0};
+        }
+
+        // === Финальная точка: если близко — считаем что доехали ===
+        const auto& last = traj.poses.back().pose.position;
+        double d_end = std::hypot(last.x - cur_x, last.y - cur_y);
+
+        // === Lookahead поиск ===
+        double look = auto_lookahead_m_;
+        double gx = 0.0, gy = 0.0;
+        bool have_goal = false;
+
+        // Найти ближайшую точку
+        size_t nearest = 0;
+        double best_d2 = 1e18;
+        for (size_t i = 0; i < traj.poses.size(); ++i) {
+            double dx = traj.poses[i].pose.position.x - cur_x;
+            double dy = traj.poses[i].pose.position.y - cur_y;
+            double d2 = dx*dx + dy*dy;
+            if (d2 < best_d2) { best_d2 = d2; nearest = i; }
+        }
+
+        // Идём вперёд до lookahead
+        for (size_t i = nearest; i < traj.poses.size(); ++i) {
+            double dx = traj.poses[i].pose.position.x - cur_x;
+            double dy = traj.poses[i].pose.position.y - cur_y;
+            if (dx*dx + dy*dy >= look*look) {
+                gx = traj.poses[i].pose.position.x;
+                gy = traj.poses[i].pose.position.y;
+                have_goal = true;
+                break;
+            }
+        }
+        // Если не нашли — берём последнюю (но только если ещё не достигли)
+        if (!have_goal) {
+            if (d_end < auto_goal_tol_m_) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                     "[AUTO] Goal reached! Stopping.");
+                return {0.0, 0.0};
+            }
+            gx = last.x;
+            gy = last.y;
+        }
+
+        // === Угол к цели в системе робота ===
+        double dx = gx - cur_x;
+        double dy = gy - cur_y;
+        double angle_to_goal = std::atan2(dy, dx);   // в map
+        double alpha = normalize_angle(angle_to_goal - cur_yaw);
+
+        // === Pure Pursuit: w = kp * alpha ===
+        // (стандартная формула w = 2v sin(alpha)/L сводится к этому же при малых alpha)
+        double w = auto_kp_heading_ * alpha * 1000.0;  // * 1000 — чтобы получить ERPM в разумном диапазоне
+        w = std::clamp(w, -auto_max_w_erpm_, auto_max_w_erpm_);
+
+        double v = auto_speed_erpm_;
+
+        // Тормозим если очень крутой угол (>90°)
+        if (std::abs(alpha) > M_PI_2) {
+            v *= 0.4;
+        } else if (std::abs(alpha) > M_PI_4) {
+            v *= 0.7;
+        }
+
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+                             "[AUTO] pos=(%.2f,%.2f) yaw=%.2f goal=(%.2f,%.2f) "
+                             "alpha=%.2f v=%.0f w=%.0f d_end=%.2f",
+                             cur_x, cur_y, cur_yaw, gx, gy, alpha, v, w, d_end);
+
+        return {v, w};
+    }
+
+    // ============================================================
+    // UTILS
+    // ============================================================
     void resetMotion() {
         linear_cmd_ = angular_cmd_ = 0.0;
         cruise_active_ = auto_mode_ = false;
         cruise_speed_ = 0.0;
     }
 
-    // ================= СМЕШИВАНИЕ =================
     std::pair<double, double> mixMotors(double v, double w) const {
         if (invert_angular_) w = -w;
         double left  = v + w;
@@ -256,20 +442,17 @@ private:
     }
 
     void emergencyStop() {
-        // Если были в автономе — снимаем эталон курса
-        if (auto_mode_ && clear_target_client_->service_is_ready()) {
-            auto req = std::make_shared<std_srvs::srv::Empty::Request>();
-            clear_target_client_->async_send_request(req);
-        }
         resetMotion();
         is_armed_ = false;
         smooth_left_ = smooth_right_ = 0.0;
-        RCLCPP_ERROR(this->get_logger(), "EMERGENCY STOP");
+        RCLCPP_ERROR(get_logger(), "EMERGENCY STOP");
         publishMotors(0.0, 0.0);
         printStatus();
     }
 
-    // ================= TCP =================
+    // ============================================================
+    // TCP
+    // ============================================================
     void cmdCallback(const std_msgs::msg::String::SharedPtr msg) {
         std::string cmd = msg->data;
         if (cmd.size() == 1) { handleKey(cmd[0]); return; }
@@ -277,54 +460,46 @@ private:
         std::lock_guard<std::mutex> lk(mtx_);
         if (cmd == "arm" || cmd == "ARM") {
             is_armed_ = true;
-            RCLCPP_WARN(this->get_logger(), "ARMED (TCP)");
+            RCLCPP_WARN(get_logger(), "ARMED (TCP)");
             printStatus(); return;
         }
         if (cmd == "disarm" || cmd == "DISARM" || cmd == "stop" || cmd == "STOP") {
-            if (auto_mode_ && clear_target_client_->service_is_ready()) {
-                auto req = std::make_shared<std_srvs::srv::Empty::Request>();
-                clear_target_client_->async_send_request(req);
-            }
             resetMotion(); is_armed_ = false;
             publishMotors(0.0, 0.0);
-            RCLCPP_WARN(this->get_logger(), "DISARMED (TCP)");
+            RCLCPP_WARN(get_logger(), "DISARMED (TCP)");
             printStatus(); return;
         }
-        RCLCPP_WARN(this->get_logger(), "Неизвестная команда: '%s'", cmd.c_str());
+        RCLCPP_WARN(get_logger(), "Неизвестная команда: '%s'", cmd.c_str());
     }
 
-    // ================= ГЛАВНЫЙ ЦИКЛ =================
+    // ============================================================
+    // ГЛАВНЫЙ ЦИКЛ (50 Гц)
+    // ============================================================
     void controlLoop() {
         double v = 0.0, w = 0.0;
+        bool armed, auto_m;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (is_armed_) {
-                if (auto_mode_) {
-                    v = linear_cmd_;
-                    double w_corr = correction_ * correction_scale_;
-                    if (invert_correction_) w_corr = -w_corr;
-                    w_corr = std::clamp(w_corr, -max_erpm_ * 0.5, max_erpm_ * 0.5);
-                    w = w_corr;
-                } else if (cruise_active_) {
-                    v = linear_cmd_;   // подруливание работает
-                    w = angular_cmd_;
-                } else {
-                    v = linear_cmd_;
-                    w = angular_cmd_;
-                }
-            }
+            armed = is_armed_;
+            auto_m = auto_mode_;
+        }
+
+        if (armed && auto_m) {
+            auto [va, wa] = compute_auto_control();
+            v = va; w = wa;
+        } else if (armed) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            v = linear_cmd_;
+            w = angular_cmd_;
         }
 
         auto [tl, tr] = mixMotors(v, w);
 
-        // === Slew-rate limiter в узле: не даём заданию прыгать ===
         const double dt = 0.02;
         const double max_delta = erpm_slew_rate_ * dt;
-
         smooth_left_  += std::clamp(tl - smooth_left_,  -max_delta, max_delta);
         smooth_right_ += std::clamp(tr - smooth_right_, -max_delta, max_delta);
 
-        // Мёртвая зона: ниже min_erpm — в ноль, чтобы VESC не дёргался
         if (std::abs(tl) < min_erpm_ && std::abs(smooth_left_)  < min_erpm_) smooth_left_  = 0.0;
         if (std::abs(tr) < min_erpm_ && std::abs(smooth_right_) < min_erpm_) smooth_right_ = 0.0;
 
@@ -334,23 +509,26 @@ private:
         if (++cnt >= 25) {
             cnt = 0;
             const char* mode = auto_mode_ ? "AUTO" : (cruise_active_ ? "CRUISE" : "MANUAL");
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_INFO(get_logger(),
                         "%s | L=%.0f R=%.0f ERPM | v=%.0f w=%.0f step=%.0f turn=%.2f",
                         mode, smooth_left_, smooth_right_, v, w, speed_step_, turn_factor_);
         }
     }
 
+    // ============================================================
+    // ПЕЧАТЬ
+    // ============================================================
     void printHelp() {
         std::cout << "\n=======================================================\n"
                   << "  VESC Teleop — 2 мотора, режим СКОРОСТИ (ERPM)\n"
                   << "-------------------------------------------------------\n"
                   << "  [E]        — ARM / DISARM\n"
-                  << "  [M]        — АВТОНОМНЫЙ РЕЖИМ\n"
-                  << "  [R] / [F]  — Больше/меньше скорость (работает и в круизе)\n"
-                  << "  [Q]        — Круиз (база = текущая скорость)\n"
-                  << "  [W] [S]    — Вперёд / Назад (залипание, повторно — стоп)\n"
-                  << "  [A] [D]    — Поворот влево/вправо (залипание)\n"
-                  << "  [,] [.]    — Меньше/больше острота поворота\n"
+                  << "  [M]        — АВТОНОМ (follow /uwb/trajectory)\n"
+                  << "  [R] / [F]  — Больше/меньше скорость\n"
+                  << "  [Q]        — Круиз\n"
+                  << "  [W] [S]    — Вперёд / Назад\n"
+                  << "  [A] [D]    — Поворот влево/вправо\n"
+                  << "  [,] [.]    — Острота поворота\n"
                   << "  [Пробел]   — АВАРИЙНЫЙ СТОП\n"
                   << "=======================================================\n\n";
     }
@@ -365,32 +543,43 @@ private:
                   << "          " << std::flush;
     }
 
-    // === Поля ===
+    // ============================================================
+    // MEMBERS
+    // ============================================================
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr left_pub_, right_pub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cmd_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr correction_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr uwb_pose_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr trajectory_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::mutex mtx_;
 
-    // === НОВЫЕ поля ===
-    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr set_target_client_;
-    rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_target_client_;
-    double auto_speed_erpm_;
+    // === Автоном ===
+    double auto_speed_erpm_, auto_lookahead_m_, auto_kp_heading_;
+    double auto_max_w_erpm_, auto_uwb_timeout_s_, auto_odom_timeout_s_;
+    double auto_goal_tol_m_;
 
+    double uwb_x_, uwb_y_, uwb_yaw_;
+    rclcpp::Time uwb_pose_time_;
+    bool uwb_pose_received_ = false;
+
+    nav_msgs::msg::Path trajectory_;
+
+    double odom_v_ = 0.0;
+    rclcpp::Time odom_time_;
+    bool odom_received_ = false;
+
+    // === Остальное ===
     bool   is_armed_;
     double linear_cmd_, angular_cmd_;
     double speed_step_, max_erpm_, erpm_step_, min_erpm_, erpm_slew_rate_;
     double turn_factor_;
-
     bool   cruise_active_;
     double cruise_speed_;
-
     bool   auto_mode_;
     double correction_;
-
     double correction_scale_;
     bool   invert_correction_, invert_left_, invert_right_, invert_angular_;
-
     double smooth_left_, smooth_right_;
 };
 
