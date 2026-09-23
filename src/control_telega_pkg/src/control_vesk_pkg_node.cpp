@@ -189,6 +189,7 @@ private:
                     return;   // причина уже в логе
                 }
                 auto_mode_ = true;
+                auto_start_time_ = this->now();
                 linear_cmd_ = auto_speed_erpm_;
                 angular_cmd_ = 0.0;
                 RCLCPP_WARN(get_logger(),
@@ -294,7 +295,7 @@ private:
             }
         }
 
-        if (trajectory_.poses.size() < 2) {
+        if (trajectory_.poses.empty()) {
             RCLCPP_ERROR(get_logger(), "[AUTO] /uwb/trajectory пустая (%zu точек)",
                          trajectory_.poses.size());
             ok = false;
@@ -377,7 +378,8 @@ private:
         }
         // Если не нашли — берём последнюю (но только если ещё не достигли)
         if (!have_goal) {
-            if (d_end < auto_goal_tol_m_) {
+            bool in_startup = (this->now() - auto_start_time_).seconds() < 1.5;
+            if (!in_startup && d_end < auto_goal_tol_m_) {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                                      "[AUTO] Goal reached! Stopping.");
                 return {0.0, 0.0};
@@ -530,6 +532,13 @@ private:
                   << "  [A] [D]    — Поворот влево/вправо\n"
                   << "  [,] [.]    — Острота поворота\n"
                   << "  [Пробел]   — АВАРИЙНЫЙ СТОП\n"
+                  << "=======================================================\n\n"
+                  << "  [Пробел]   — АВАРИЙНЫЙ СТОП\n"
+                  << "-------------------------------------------------------\n"
+                  << "  Сервисы (из другого терминала):\n"
+                  << "    ros2 service call /tag_localizer_pkg_node/build_coverage_trajectory std_srvs/srv/Empty\n"
+                  << "    ros2 service call /tag_localizer_pkg_node/build_trajectory_from_clicks std_srvs/srv/Empty\n"
+                  << "    ros2 service call /tag_localizer_pkg_node/clear_points std_srvs/srv/Empty\n"
                   << "=======================================================\n\n";
     }
 
@@ -553,6 +562,7 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::mutex mtx_;
+    rclcpp::Time auto_start_time_;
 
     // === Автоном ===
     double auto_speed_erpm_, auto_lookahead_m_, auto_kp_heading_;
